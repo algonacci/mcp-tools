@@ -1,60 +1,8 @@
 from mcp.server.fastmcp import FastMCP, Context
-from dotenv import load_dotenv
-load_dotenv()
 import os
-import httpx
-from typing import Dict, Any, Optional
+from tavily import TavilyClient
+from typing import Dict, Any
 from contextlib import asynccontextmanager
-import asyncio
-
-class TavilyClient:
-    """Simple client for interacting with the Tavily Search API."""
-    
-    def __init__(self, api_key: str):
-        self.api_key = api_key
-        self.base_url = "https://api.tavily.com/v1"
-        
-    async def search(
-        self,
-        query: str,
-        search_depth: str = "advanced",
-        max_results: int = 10,
-        time_range: str = "year",
-        include_answer: str = "advanced",
-    ) -> Dict[str, Any]:
-        """
-        Perform a search using the Tavily API.
-        
-        Args:
-            query: The search query
-            search_depth: Either "basic" or "advanced"
-            max_results: Maximum number of results to return
-            time_range: Time range for search (e.g., "day", "week", "month", "year")
-            include_answer: Whether to include an AI-generated answer ("basic", "advanced", or None)
-            
-        Returns:
-            The search results from Tavily
-        """
-        url = f"{self.base_url}/search"
-        
-        headers = {
-            "Content-Type": "application/json",
-            "X-Api-Key": self.api_key
-        }
-        
-        payload = {
-            "query": query,
-            "search_depth": search_depth,
-            "max_results": max_results,
-            "time_range": time_range,
-            "include_answer": include_answer
-        }
-        
-        async with httpx.AsyncClient() as client:
-            response = await client.post(url, json=payload, headers=headers)
-            response.raise_for_status()
-            return response.json()
-
 
 # Create a server context class to hold the Tavily client
 class ServerContext:
@@ -71,7 +19,7 @@ async def server_lifespan(server: FastMCP):
         raise ValueError("TAVILY_API_KEY environment variable is required")
     
     # Create Tavily client
-    tavily_client = TavilyClient(api_key)
+    tavily_client = TavilyClient(api_key=api_key)
     
     # Yield the context to be used by tools
     yield ServerContext(tavily_client)
@@ -79,12 +27,12 @@ async def server_lifespan(server: FastMCP):
 # Create the MCP server
 mcp = FastMCP(
     "Tavily Search", 
-    dependencies=["httpx"],
+    dependencies=["tavily"],
     lifespan=server_lifespan
 )
 
 @mcp.tool()
-async def search(
+def search(
     query: str,
     ctx: Context,
     search_depth: str = "advanced",
@@ -111,10 +59,10 @@ async def search(
     
     # Report progress
     ctx.info(f"Searching for: {query}")
-    await ctx.report_progress(50, 100)
+    ctx.report_progress(50, 100)
     
     # Perform the search
-    response = await tavily_client.search(
+    response = tavily_client.search(
         query=query,
         search_depth=search_depth,
         max_results=max_results,
@@ -123,13 +71,27 @@ async def search(
     )
     
     # Complete progress
-    await ctx.report_progress(100, 100)
+    ctx.report_progress(100, 100)
     ctx.info("Search complete")
     
     return response
 
+# Global Tavily client for resource handler
+# Note: We need this because resource handlers can't access the context with URI parameters
+_tavily_client = None
+
+def get_tavily_client():
+    """Get or create a global Tavily client instance"""
+    global _tavily_client
+    if _tavily_client is None:
+        api_key = os.environ.get("TAVILY_API_KEY")
+        if not api_key:
+            raise ValueError("TAVILY_API_KEY environment variable is required")
+        _tavily_client = TavilyClient(api_key=api_key)
+    return _tavily_client
+
 @mcp.resource("search://{query}")
-async def search_resource(query: str) -> str:
+def search_resource(query: str) -> str:
     """
     Search the web and return results as a resource.
     This is useful for getting search results directly into context.
@@ -137,16 +99,11 @@ async def search_resource(query: str) -> str:
     Args:
         query: The search query to perform
     """
-    # Create a Tavily client directly
-    # Note: This is less ideal than using the context, but works for resource handlers
-    api_key = os.environ.get("TAVILY_API_KEY")
-    if not api_key:
-        raise ValueError("TAVILY_API_KEY environment variable is required")
-    
-    tavily_client = TavilyClient(api_key)
+    # Get the Tavily client
+    tavily_client = get_tavily_client()
     
     # Perform a basic search
-    response = await tavily_client.search(
+    response = tavily_client.search(
         query=query,
         search_depth="basic",
         max_results=5,
