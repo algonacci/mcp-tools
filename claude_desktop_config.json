@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "mcp-tools": {
+      "command": "uv",
+      "args": [
+        "--directory",
+        "C:/Users/Braincore/Documents/GitHub/mcp-tools",
+        "run",
+        "python",
+        "server.py"
+      ]
+    }
+  }
+}
