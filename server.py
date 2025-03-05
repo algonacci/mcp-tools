@@ -1,5 +1,7 @@
 from mcp.server.fastmcp import FastMCP, Context
 import os
+from dotenv import load_dotenv
+load_dotenv()
 from tavily import TavilyClient
 from typing import Dict, Any
 from contextlib import asynccontextmanager
@@ -105,9 +107,9 @@ def search_resource(query: str) -> str:
     # Perform a basic search
     response = tavily_client.search(
         query=query,
-        search_depth="basic",
-        max_results=5,
-        include_answer="basic",
+        search_depth="advanced",
+        max_results=10,
+        include_answer="advanced",
     )
     
     # Format the results as readable text
