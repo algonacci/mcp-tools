@@ -1,47 +1,31 @@
-from mcp.server.fastmcp import FastMCP, Context
-import os
+from mcp.server.fastmcp import FastMCP
+
+from tavily import TavilyClient
 from dotenv import load_dotenv
 load_dotenv()
-from tavily import TavilyClient
-from typing import Dict, Any
-from contextlib import asynccontextmanager
-
-# Create a server context class to hold the Tavily client
-class ServerContext:
-    def __init__(self, tavily_client: TavilyClient):
-        self.tavily_client = tavily_client
-
-# Define the lifespan for the MCP server
-@asynccontextmanager
-async def server_lifespan(server: FastMCP):
-    """Initialize the Tavily client on server startup."""
-    # Get API key from environment
-    api_key = os.environ.get("TAVILY_API_KEY")
-    if not api_key:
-        raise ValueError("TAVILY_API_KEY environment variable is required")
-    
-    # Create Tavily client
-    tavily_client = TavilyClient(api_key=api_key)
-    
-    # Yield the context to be used by tools
-    yield ServerContext(tavily_client)
+import os
 
 # Create the MCP server
 mcp = FastMCP(
     "Tavily Search", 
-    dependencies=["tavily"],
-    lifespan=server_lifespan
+    dependencies=["tavily"]
 )
+
+# Initialize the Tavily client once
+tavily_api_key = os.environ.get("TAVILY_API_KEY")
+if not tavily_api_key:
+    raise ValueError("TAVILY_API_KEY environment variable must be set")
+
+tavily_client = TavilyClient(api_key=tavily_api_key)
 
 @mcp.tool()
 def search(
     query: str,
-    ctx: Context,
     search_depth: str = "advanced",
     max_results: int = 10,
     time_range: str = "year",
     include_answer: str = "advanced",
-) -> Dict[str, Any]:
+) -> dict:
     """
     Search the web using Tavily's search API.
     
@@ -55,15 +39,7 @@ def search(
     Returns:
         Search results including links, snippets, and potentially an AI answer
     """
-    # Get the Tavily client from context
-    server_ctx = ctx.request_context.lifespan_context
-    tavily_client = server_ctx.tavily_client
-    
-    # Report progress
-    ctx.info(f"Searching for: {query}")
-    ctx.report_progress(50, 100)
-    
-    # Perform the search
+    # Perform the search using the Tavily client
     response = tavily_client.search(
         query=query,
         search_depth=search_depth,
@@ -72,25 +48,7 @@ def search(
         include_answer=include_answer,
     )
     
-    # Complete progress
-    ctx.report_progress(100, 100)
-    ctx.info("Search complete")
-    
     return response
-
-# Global Tavily client for resource handler
-# Note: We need this because resource handlers can't access the context with URI parameters
-_tavily_client = None
-
-def get_tavily_client():
-    """Get or create a global Tavily client instance"""
-    global _tavily_client
-    if _tavily_client is None:
-        api_key = os.environ.get("TAVILY_API_KEY")
-        if not api_key:
-            raise ValueError("TAVILY_API_KEY environment variable is required")
-        _tavily_client = TavilyClient(api_key=api_key)
-    return _tavily_client
 
 @mcp.resource("search://{query}")
 def search_resource(query: str) -> str:
@@ -101,15 +59,12 @@ def search_resource(query: str) -> str:
     Args:
         query: The search query to perform
     """
-    # Get the Tavily client
-    tavily_client = get_tavily_client()
-    
     # Perform a basic search
     response = tavily_client.search(
         query=query,
-        search_depth="advanced",
-        max_results=10,
-        include_answer="advanced",
+        search_depth="basic",
+        max_results=5,
+        include_answer="basic",
     )
     
     # Format the results as readable text
