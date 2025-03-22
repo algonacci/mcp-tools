@@ -10,6 +10,7 @@ import pandas as pd
 from sqlalchemy import create_engine, text, inspect
 from tavily import TavilyClient
 from dotenv import load_dotenv
+import wikipedia
 
 # Load environment variables
 load_dotenv()
@@ -51,7 +52,8 @@ mcp = FastMCP(
         "sqlalchemy",
         "pandas",
         "pymysql",
-        "psycopg2-binary"
+        "psycopg2-binary",
+        "wikipedia",
     ],
     lifespan=app_lifespan
 )
@@ -1357,6 +1359,28 @@ def read_excel(file_path: str, sheet_name: str = None) -> pd.DataFrame:
         raise e
     except Exception as e:
         raise Exception(f"Error reading Excel file: {str(e)}")
+
+# Wikipedia
+@mcp.tool()
+def search(query: str):
+    return wikipedia.search(query)
+
+@mcp.tool()
+def summary(query: str):
+    return wikipedia.summary(query)
+
+@mcp.tool()
+def page(query: str):
+    return wikipedia.page(query)
+
+@mcp.tool()
+def random():
+    return wikipedia.random()
+
+@mcp.tool()
+def set_lang(lang: str):
+    wikipedia.set_lang(lang)
+    return f"Language set to {lang}"
 
 
 # Allow direct execution of the server
