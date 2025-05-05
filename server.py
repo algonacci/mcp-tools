@@ -1385,4 +1385,5 @@ def set_lang(lang: str):
 
 # Allow direct execution of the server
 if __name__ == "__main__":
+    print("Running MCP server...")
     mcp.run()
