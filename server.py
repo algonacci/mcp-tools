@@ -16,7 +16,8 @@ from pathlib import Path
 import httpx
 import asyncio
 import json
-
+from playwright.async_api import async_playwright, Page
+from playwright_stealth import Stealth
 # Load environment variables
 load_dotenv()
 
@@ -61,6 +62,8 @@ mcp = FastMCP(
         "wikipedia",
         "arxiv",
         "httpx",
+        "playwright",
+        "playwright-stealth"
     ],
     lifespan=app_lifespan
 )
@@ -1597,6 +1600,186 @@ async def search_ieee(query: str, limit: int = 10, start_year: int = None, end_y
         except Exception as e:
             return json.dumps({"error": f"Error occurred: {str(e)}"}, indent=2)
 
+
+
+#
+# ScienceDirect functionality
+#
+
+@mcp.tool()
+async def search_sciencedirect(query: str, limit: int = 3) -> str:
+    """
+    Search ScienceDirect for papers and extract abstracts.
+    
+    Args:
+        query: The search query (e.g., "text-to-sql")
+        limit: Max number of results to process (default: 3)
+    """
+    print(f"Launching Browser (Persistent Context) to search for: {query}...")
+
+    # Create user_data directory if not exists
+    user_data_dir = os.path.join(os.getcwd(), "user_data")
+    os.makedirs(user_data_dir, exist_ok=True)
+
+    async with async_playwright() as p:
+        # Using launch_persistent_context for persistence and stealth
+        # Headless configurable via env var, default to False (safer for bot detection)
+        # Users can set HEADLESS=true in .env if they extracted valid cookies/state
+        headless_mode = os.getenv("HEADLESS", "false").lower() == "true"
+        
+        context = await p.chromium.launch_persistent_context(
+            user_data_dir=user_data_dir,
+            headless=headless_mode,
+            args=[
+                '--disable-blink-features=AutomationControlled',
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+            ],
+            ignore_default_args=["--enable-automation"],
+            locale="id-ID",
+            viewport={"width": 1920, "height": 1080}
+        )
+        
+        page = context.pages[0] if context.pages else await context.new_page()
+
+        # Token capture mechanism
+        token_container = {"token": None}
+
+        async def handle_request(request):
+            if "sciencedirect.com/search/api?" in request.url:
+                # url parse
+                from urllib.parse import urlparse, parse_qs
+                parsed = urlparse(request.url)
+                qs = parse_qs(parsed.query)
+                t_val = qs.get("t", [None])[0]
+                if t_val and not token_container["token"]:
+                    token_container["token"] = t_val
+                    print("Token captured via network interception.")
+
+        page.on("request", handle_request)
+
+        try:
+            print("Navigating to ScienceDirect...")
+            # Navigate to generic search page to trigger token generation
+            # URL encode the query
+            import urllib.parse
+            encoded_query = urllib.parse.quote(query)
+            
+            try:
+                await page.goto(f"https://www.sciencedirect.com/search?qs={encoded_query}", wait_until="domcontentloaded", timeout=60000)
+            except Exception as e:
+                print(f"Navigation warning: {e}")
+                print("Continuing as the page might have loaded partially...")
+
+            # Wait a bit for token if not yet caught
+            if not token_container["token"]:
+                await asyncio.sleep(5)
+                
+            # Manual intervention block
+            if not token_container["token"]:
+                print("Token not yet captured. Waiting 15s for manual intervention if needed...")
+                await asyncio.sleep(15)
+
+            token = token_container["token"]
+            
+            if not token:
+                return "Error: Could not capture ScienceDirect API token. Blocking may be active."
+            
+            print("Token intercepted. Fetching metadata API...")
+
+            # Execute fetch inside browser context
+            js_script = """
+            async (args) => {
+                const { token, query } = args;
+                const apiUrl = `https://www.sciencedirect.com/search/api?qs=${encodeURIComponent(query)}&t=${token}&hostname=www.sciencedirect.com`;
+                try {
+                    const resp = await fetch(apiUrl, {
+                        headers: { "X-Requested-With": "XMLHttpRequest" }
+                    });
+                    if (resp.ok) return await resp.json();
+                    return { error: `HTTP ${resp.status}` };
+                } catch (e) {
+                    return { error: e.message };
+                }
+            }
+            """
+            
+            results = await page.evaluate(js_script, {"token": token, "query": query})
+
+            if not results or results.get("error"):
+                return f"API Call Failed: {results.get('error') if results else 'Unknown error'}"
+
+            search_results = results.get("searchResults", [])
+            total_found = results.get("resultsFound", 0)
+            
+            print(f"Found {total_found} results. Processing top {limit}...")
+
+            output = f"# ScienceDirect Search Results for: '{query}'\n"
+            output += f"**Total Found:** {total_found} | **Showing Top:** {limit}\n\n"
+            
+            process_count = min(limit, len(search_results))
+            
+            for i in range(process_count):
+                record = search_results[i]
+                title = record.get("title", "No Title")
+                link = record.get("link", "")
+                if link and not link.startswith("http"):
+                    link = "https://www.sciencedirect.com" + link
+                    
+                doi = record.get("doi", "N/A")
+                authors_list = record.get("authors", [])
+                authors = "; ".join([a.get("name") for a in authors_list]) if authors_list else "N/A"
+
+                print(f"[{i+1}/{process_count}] Navigating to extract abstract...")
+                
+                abstract = "Abstract could not be loaded"
+                
+                try:
+                    await page.goto(link, wait_until="domcontentloaded", timeout=45000)
+                    await asyncio.sleep(2)
+                    
+                    abstract = await page.evaluate("""() => {
+                        const selectors = [
+                            '#abstracts', 
+                            '.Abstracts', 
+                            'div[class*="Abstract"]', 
+                            'section[id="abstracts"]',
+                            '.abstract'
+                        ];
+                        
+                        for (const sel of selectors) {
+                            const el = document.querySelector(sel);
+                            if (el && el.innerText.trim().length > 20) {
+                                return el.innerText.replace(/^(Abstract|Summary)\s*/i, '').trim();
+                            }
+                        }
+                        return null;
+                    }""")
+                    
+                    if not abstract:
+                        abstract = "Abstract section not found in the DOM (Access might be restricted)."
+                    
+                except Exception as e:
+                    abstract = f"(Page Load Error: {str(e)})"
+                
+                entry = f"""
+## {i+1}. {title}
+**Authors:** {authors}
+**DOI:** {doi}
+**Link:** [View Article]({link})
+
+### Abstract
+{abstract}
+
+---
+"""
+                output += entry
+                await asyncio.sleep(1)
+
+        finally:
+            await context.close()
+            
+        return output
 
 # Allow direct execution of the server
 if __name__ == "__main__":
