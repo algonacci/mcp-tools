@@ -1738,7 +1738,7 @@ async def search_sciencedirect(query: str, limit: int = 3) -> str:
                     await page.goto(link, wait_until="domcontentloaded", timeout=45000)
                     await asyncio.sleep(2)
                     
-                    abstract = await page.evaluate("""() => {
+                    abstract = await page.evaluate(r"""() => {
                         const selectors = [
                             '#abstracts', 
                             '.Abstracts', 
