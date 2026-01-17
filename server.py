@@ -139,6 +139,7 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[ServerContext]:
         pass  # No cleanup needed
 
 # Configure FastMCP with dependencies and lifespan
+mcp = FastMCP(
     dependencies=[
         "gnews", 
         "tavily-python", 
