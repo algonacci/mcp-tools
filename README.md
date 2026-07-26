@@ -26,9 +26,9 @@ and daily forecasts without an API key. Search for a place with
 
 ## Currency conversion
 
-Frankfurter tools list supported currencies, return current and historical
-exchange rates, and convert amounts without an API key. Currency codes use
-three-letter notation such as `USD`, `IDR`, and `EUR`.
+Frankfurter tools list currencies and providers, return current, historical,
+multi-currency, and provider-specific rates, and convert amounts without an API
+key. Currency codes use three-letter notation such as `USD`, `IDR`, and `EUR`.
 
 ## Email configuration
 

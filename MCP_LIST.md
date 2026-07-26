@@ -22,8 +22,9 @@ notebook reading (`read_pdf`, `read_excel`, `read_notebook`), Wikipedia (`summar
   (`connect_drive`, `drive_health`, `search_drive_files`, `get_drive_file`,
   `read_drive_file`, `download_drive_file`), and Open-Meteo weather
   (`search_weather_locations`, `get_current_weather`, `get_hourly_forecast`,
-  `get_daily_forecast`), and Frankfurter currencies (`list_currencies`,
-  `get_exchange_rate`, `convert_currency`, `get_exchange_rate_history`).
+  `get_daily_forecast`), and Frankfurter currencies (`list_currencies`, `get_currency`,
+  `list_exchange_rate_providers`, `get_rates`, `get_exchange_rate`, `convert_currency`,
+  `get_exchange_rate_history`).
 
 ## High priority — personal assistant essentials
 

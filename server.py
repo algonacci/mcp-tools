@@ -2713,9 +2713,15 @@ def parse_currency_date(value: str, name: str) -> date:
 
 
 @mcp.tool()
-def list_currencies(query: str | None = None) -> Dict[str, Any]:
-    """List currencies supported by Frankfurter, optionally filtered by code or name."""
-    currencies = frankfurter_request("currencies")
+def list_currencies(
+    query: str | None = None,
+    include_legacy: bool = False,
+) -> Dict[str, Any]:
+    """List supported currencies, optionally including legacy currencies."""
+    currencies = frankfurter_request(
+        "currencies",
+        {"scope": "all"} if include_legacy else None,
+    )
     if query:
         needle = query.strip().lower()
         currencies = [
@@ -2728,21 +2734,85 @@ def list_currencies(query: str | None = None) -> Dict[str, Any]:
 
 
 @mcp.tool()
-def get_exchange_rate(base: str, quote: str) -> Dict[str, Any]:
-    """Get the latest exchange rate between two currencies."""
+def get_currency(code: str) -> Dict[str, Any]:
+    """Get details and provider coverage for one currency."""
+    return frankfurter_request(
+        f"currency/{validate_currency_code(code, 'code')}"
+    )
+
+
+@mcp.tool()
+def list_exchange_rate_providers(query: str | None = None) -> Dict[str, Any]:
+    """List central banks and other exchange-rate data providers."""
+    providers = frankfurter_request("providers")
+    if query:
+        needle = query.strip().lower()
+        providers = [
+            item
+            for item in providers
+            if needle in item.get("key", "").lower()
+            or needle in item.get("name", "").lower()
+            or needle in (item.get("country_code") or "").lower()
+        ]
+    return {"count": len(providers), "providers": providers}
+
+
+@mcp.tool()
+def get_rates(
+    base: str = "EUR",
+    quotes: str | None = None,
+    rate_date: str | None = None,
+    providers: str | None = None,
+    include_providers: bool = False,
+) -> Dict[str, Any]:
+    """Get latest or historical rates for multiple comma-separated quote currencies."""
+    params = {"base": validate_currency_code(base, "base")}
+    if quotes:
+        params["quotes"] = ",".join(
+            validate_currency_code(code, "quotes") for code in quotes.split(",")
+        )
+    if rate_date:
+        params["date"] = parse_currency_date(rate_date, "rate_date").isoformat()
+    if providers:
+        params["providers"] = providers.upper()
+    if include_providers:
+        params["expand"] = "providers"
+    rates = frankfurter_request("rates", params)
+    return {"count": len(rates), "rates": rates}
+
+
+@mcp.tool()
+def get_exchange_rate(
+    base: str,
+    quote: str,
+    rate_date: str | None = None,
+    providers: str | None = None,
+) -> Dict[str, Any]:
+    """Get a latest or historical rate, optionally from selected providers."""
     base_code = validate_currency_code(base, "base")
     quote_code = validate_currency_code(quote, "quote")
     if base_code == quote_code:
         raise ValueError("base and quote currencies must be different")
-    return frankfurter_request(f"rate/{base_code}/{quote_code}")
+    params = {}
+    if rate_date:
+        params["date"] = parse_currency_date(rate_date, "rate_date").isoformat()
+    if providers:
+        params["providers"] = providers.upper()
+    return frankfurter_request(f"rate/{base_code}/{quote_code}", params or None)
 
 
 @mcp.tool()
-def convert_currency(amount: float, base: str, quote: str) -> Dict[str, Any]:
-    """Convert a non-negative amount using the latest Frankfurter exchange rate."""
+def convert_currency(
+    amount: float,
+    base: str,
+    quote: str,
+    rate_date: str | None = None,
+    providers: str | None = None,
+) -> Dict[str, Any]:
+    """Convert an amount using a latest or historical exchange rate."""
     if amount < 0:
         raise ValueError("amount cannot be negative")
-    rate = get_exchange_rate(base, quote)
+    rate = get_exchange_rate(base, quote, rate_date, providers)
     return {
         "date": rate["date"],
         "base": rate["base"],
@@ -2759,8 +2829,11 @@ def get_exchange_rate_history(
     quote: str,
     start_date: str,
     end_date: str,
+    group: str | None = None,
+    providers: str | None = None,
+    include_providers: bool = False,
 ) -> Dict[str, Any]:
-    """Get daily exchange rates over a date range of up to one year."""
+    """Get a daily, weekly, or monthly exchange-rate time series."""
     base_code = validate_currency_code(base, "base")
     quote_code = validate_currency_code(quote, "quote")
     if base_code == quote_code:
@@ -2769,18 +2842,27 @@ def get_exchange_rate_history(
     end = parse_currency_date(end_date, "end_date")
     if end < start:
         raise ValueError("end_date cannot be before start_date")
-    if (end - start).days > 366:
-        raise ValueError("date range cannot exceed one year")
+    days = (end - start).days
+    if group not in {None, "week", "month"}:
+        raise ValueError("group must be week, month, or omitted")
+    if days > 366 and group is None:
+        raise ValueError("ranges over one year must use weekly or monthly grouping")
+    if days > 36525:
+        raise ValueError("date range cannot exceed 100 years")
 
-    rates = frankfurter_request(
-        "rates",
-        {
-            "from": start.isoformat(),
-            "to": end.isoformat(),
-            "base": base_code,
-            "quotes": quote_code,
-        },
-    )
+    params = {
+        "from": start.isoformat(),
+        "to": end.isoformat(),
+        "base": base_code,
+        "quotes": quote_code,
+    }
+    if group:
+        params["group"] = group
+    if providers:
+        params["providers"] = providers.upper()
+    if include_providers:
+        params["expand"] = "providers"
+    rates = frankfurter_request("rates", params)
     return {
         "base": base_code,
         "quote": quote_code,
