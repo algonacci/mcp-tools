@@ -15,14 +15,20 @@ typing. Run it again whenever you want to add or update an integration.
 
 You do not need to configure every integration. The MCP server still starts
 with a partial or missing `.env`; tools such as GARUDA, Wikipedia, Google News,
-Open-Meteo weather, PDF, and local file readers remain available. A tool that needs missing
-credentials returns a setup error only when that tool is called.
+Open-Meteo weather, PDF, and local file readers remain available. A tool that
+needs missing credentials returns a setup error only when that tool is called.
 
 ## Weather
 
 Open-Meteo tools provide place search, current conditions, hourly forecasts,
 and daily forecasts without an API key. Search for a place with
 `search_weather_locations`, then pass its coordinates to a forecast tool.
+
+## Currency conversion
+
+Frankfurter tools list supported currencies, return current and historical
+exchange rates, and convert amounts without an API key. Currency codes use
+three-letter notation such as `USD`, `IDR`, and `EUR`.
 
 ## Email configuration
 

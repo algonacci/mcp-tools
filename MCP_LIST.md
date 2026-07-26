@@ -22,7 +22,8 @@ notebook reading (`read_pdf`, `read_excel`, `read_notebook`), Wikipedia (`summar
   (`connect_drive`, `drive_health`, `search_drive_files`, `get_drive_file`,
   `read_drive_file`, `download_drive_file`), and Open-Meteo weather
   (`search_weather_locations`, `get_current_weather`, `get_hourly_forecast`,
-  `get_daily_forecast`).
+  `get_daily_forecast`), and Frankfurter currencies (`list_currencies`,
+  `get_exchange_rate`, `convert_currency`, `get_exchange_rate_history`).
 
 ## High priority — personal assistant essentials
 
@@ -48,8 +49,8 @@ notebook reading (`read_pdf`, `read_excel`, `read_notebook`), Wikipedia (`summar
   already know) with "find the file that mentions X."
 - [x] **Weather** — current conditions and short forecast by city/coordinates. Small, self-
   contained, commonly requested by a personal-assistant bot.
-- [ ] **Currency/unit conversion** — a lot of "how much is X in Y" questions currently have no
-  clean tool; `get_price`/`get_price_history` only cover crypto.
+- [x] **Currency conversion** — current and historical fiat exchange rates plus amount conversion
+  are available through Frankfurter. General unit conversion remains a separate capability.
 - [ ] **Calendar-adjacent reminders vs. Kumo's own `schedule_task`** — worth explicitly *not*
   building a duplicate scheduling tool here. Kumo's `schedule_task` already covers "run this prompt
   later"; an MCP calendar tool should stay a read/write interface to Google Calendar itself, not a

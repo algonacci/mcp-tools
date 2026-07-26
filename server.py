@@ -18,7 +18,7 @@ import httpx
 import asyncio
 from io import BytesIO
 import json
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from urllib.parse import urljoin
 from playwright.async_api import async_playwright, Page
 from playwright_stealth import Stealth
@@ -2666,6 +2666,129 @@ async def compare_coins(
         }
         for coin in data
     ]
+
+
+#
+# Frankfurter currency functionality
+#
+
+FRANKFURTER_BASE_URL = "https://api.frankfurter.dev/v2"
+FRANKFURTER_TIMEOUT = 15.0
+
+
+def frankfurter_request(
+    path: str,
+    params: Dict[str, Any] | None = None,
+) -> Any:
+    try:
+        response = httpx.get(
+            f"{FRANKFURTER_BASE_URL}/{path}",
+            params=params,
+            timeout=FRANKFURTER_TIMEOUT,
+        )
+        response.raise_for_status()
+        return response.json()
+    except httpx.HTTPStatusError as exc:
+        try:
+            detail = exc.response.json()
+        except ValueError:
+            detail = exc.response.text
+        raise ValueError(f"Frankfurter API error: {detail}") from exc
+    except httpx.RequestError as exc:
+        raise ConnectionError(f"Could not reach Frankfurter API: {exc}") from exc
+
+
+def validate_currency_code(value: str, name: str) -> str:
+    code = value.strip().upper()
+    if len(code) != 3 or not code.isalpha():
+        raise ValueError(f"{name} must be a three-letter currency code")
+    return code
+
+
+def parse_currency_date(value: str, name: str) -> date:
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").date()
+    except ValueError as exc:
+        raise ValueError(f"{name} must use YYYY-MM-DD format") from exc
+
+
+@mcp.tool()
+def list_currencies(query: str | None = None) -> Dict[str, Any]:
+    """List currencies supported by Frankfurter, optionally filtered by code or name."""
+    currencies = frankfurter_request("currencies")
+    if query:
+        needle = query.strip().lower()
+        currencies = [
+            item
+            for item in currencies
+            if needle in item.get("iso_code", "").lower()
+            or needle in item.get("name", "").lower()
+        ]
+    return {"count": len(currencies), "currencies": currencies}
+
+
+@mcp.tool()
+def get_exchange_rate(base: str, quote: str) -> Dict[str, Any]:
+    """Get the latest exchange rate between two currencies."""
+    base_code = validate_currency_code(base, "base")
+    quote_code = validate_currency_code(quote, "quote")
+    if base_code == quote_code:
+        raise ValueError("base and quote currencies must be different")
+    return frankfurter_request(f"rate/{base_code}/{quote_code}")
+
+
+@mcp.tool()
+def convert_currency(amount: float, base: str, quote: str) -> Dict[str, Any]:
+    """Convert a non-negative amount using the latest Frankfurter exchange rate."""
+    if amount < 0:
+        raise ValueError("amount cannot be negative")
+    rate = get_exchange_rate(base, quote)
+    return {
+        "date": rate["date"],
+        "base": rate["base"],
+        "quote": rate["quote"],
+        "rate": rate["rate"],
+        "amount": amount,
+        "converted_amount": amount * rate["rate"],
+    }
+
+
+@mcp.tool()
+def get_exchange_rate_history(
+    base: str,
+    quote: str,
+    start_date: str,
+    end_date: str,
+) -> Dict[str, Any]:
+    """Get daily exchange rates over a date range of up to one year."""
+    base_code = validate_currency_code(base, "base")
+    quote_code = validate_currency_code(quote, "quote")
+    if base_code == quote_code:
+        raise ValueError("base and quote currencies must be different")
+    start = parse_currency_date(start_date, "start_date")
+    end = parse_currency_date(end_date, "end_date")
+    if end < start:
+        raise ValueError("end_date cannot be before start_date")
+    if (end - start).days > 366:
+        raise ValueError("date range cannot exceed one year")
+
+    rates = frankfurter_request(
+        "rates",
+        {
+            "from": start.isoformat(),
+            "to": end.isoformat(),
+            "base": base_code,
+            "quotes": quote_code,
+        },
+    )
+    return {
+        "base": base_code,
+        "quote": quote_code,
+        "start_date": start.isoformat(),
+        "end_date": end.isoformat(),
+        "count": len(rates),
+        "rates": rates,
+    }
 
 
 #
