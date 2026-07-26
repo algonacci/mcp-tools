@@ -18,7 +18,9 @@ notebook reading (`read_pdf`, `read_excel`, `read_notebook`), Wikipedia (`summar
 `search_emails`, `send_email`, `mark_read`, `mark_unread`, `delete_email`, `list_attachments`,
 `summarize_email`), and Google Calendar (`connect_calendar`, `calendar_health`, `list_calendars`,
 `list_events`, `get_event`, `create_event`, `update_event`, `delete_event`, `list_calendar_acl`,
-`share_calendar`, `watch_calendar_events`, `list_event_changes`).
+  `share_calendar`, `watch_calendar_events`, `list_event_changes`), and Google Drive
+  (`connect_drive`, `drive_health`, `search_drive_files`, `get_drive_file`,
+  `read_drive_file`, `download_drive_file`).
 
 ## High priority — personal assistant essentials
 
@@ -29,7 +31,7 @@ notebook reading (`read_pdf`, `read_excel`, `read_notebook`), Wikipedia (`summar
 - [x] **Google Calendar** — list and search events, inspect details, create/update/delete events,
   add Google Meet links, manage ACL sharing, watch changes, and use incremental sync tokens.
   Kumo should require confirmation before write operations.
-- [ ] **Google Drive / Docs** — search files by name, read a Doc's or Sheet's content as text.
+- [x] **Google Drive / Docs** — search files by name, read a Doc's or Sheet's content as text.
   Useful once Gmail/Calendar exist, since a lot of personal workflows touch all three together.
 
 ## Medium priority — clearly useful, less urgent

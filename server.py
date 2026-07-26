@@ -16,6 +16,7 @@ import arxiv
 from pathlib import Path
 import httpx
 import asyncio
+from io import BytesIO
 import json
 from datetime import datetime, timezone
 from urllib.parse import urljoin
@@ -25,7 +26,9 @@ from bs4 import BeautifulSoup
 import email
 import imaplib
 import logging
+import signal
 import smtplib
+import sys
 from email.header import decode_header, make_header
 from email.message import EmailMessage, Message
 from uuid import uuid4
@@ -35,6 +38,7 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+from googleapiclient.http import MediaIoBaseDownload
 # Load environment variables
 load_dotenv()
 
@@ -139,19 +143,14 @@ def filter_has_error(blocks, has_error=True):
 @dataclass
 class ServerContext:
     gnews_client: gnews.GNews
-    tavily_client: TavilyClient
+    tavily_client: Optional[TavilyClient]
 
 @asynccontextmanager
 async def app_lifespan(server: FastMCP) -> AsyncIterator[ServerContext]:
     """Initialize clients on startup"""
-    # Check for Tavily API key
     tavily_api_key = os.environ.get("TAVILY_API_KEY")
-    if not tavily_api_key:
-        raise ValueError("TAVILY_API_KEY environment variable must be set")
-    
-    # Initialize clients
     default_gnews = gnews.GNews()
-    tavily_client = TavilyClient(api_key=tavily_api_key)
+    tavily_client = TavilyClient(api_key=tavily_api_key) if tavily_api_key else None
     
     try:
         yield ServerContext(
@@ -190,7 +189,6 @@ mcp = FastMCP(
 
 # ArXiv storage path configuration
 STORAGE_PATH = Path(os.getenv("ARXIV_PAPER_STORAGE_PATH", str(Path.cwd() / "downloads")))
-STORAGE_PATH.mkdir(parents=True, exist_ok=True)
 
 #
 # SQL Database functionality
@@ -957,7 +955,7 @@ def tavily_search(
     Returns:
         Search results including links, snippets, and potentially an AI answer
     """
-    if ctx and hasattr(ctx.request_context.lifespan_context, 'tavily_client'):
+    if ctx and getattr(ctx.request_context.lifespan_context, "tavily_client", None):
         # Get Tavily client from context
         tavily_client = ctx.request_context.lifespan_context.tavily_client
     else:
@@ -1037,7 +1035,7 @@ def extract_url(url: str, ctx: Context = None) -> dict:
     Returns:
         The extracted content
     """
-    if ctx and hasattr(ctx.request_context.lifespan_context, 'tavily_client'):
+    if ctx and getattr(ctx.request_context.lifespan_context, "tavily_client", None):
         # Get Tavily client from context
         tavily_client = ctx.request_context.lifespan_context.tavily_client
     else:
@@ -1618,6 +1616,7 @@ def download_paper(paper_id: str) -> str:
     
     try:
         paper = next(client.results(search))
+        STORAGE_PATH.mkdir(parents=True, exist_ok=True)
         
         # Create filename
         safe_title = "".join([c if c.isalnum() else "_" for c in paper.title])
@@ -2670,15 +2669,23 @@ async def compare_coins(
 
 
 #
-# Google Calendar functionality
+# Google Calendar and Drive functionality
 #
 
-GOOGLE_CALENDAR_SCOPES = ["https://www.googleapis.com/auth/calendar"]
+GOOGLE_SCOPES = [
+    "https://www.googleapis.com/auth/calendar",
+    "https://www.googleapis.com/auth/drive.readonly",
+]
 GOOGLE_CREDENTIALS = os.getenv("GOOGLE_CREDENTIALS", "credentials.json")
 GOOGLE_TOKEN = os.getenv("GOOGLE_TOKEN", "token.json")
 GOOGLE_CALENDAR_TIMEZONE = os.getenv("GOOGLE_CALENDAR_TIMEZONE", "Asia/Jakarta")
+GOOGLE_DRIVE_DOWNLOAD_PATH = Path(
+    os.getenv("GOOGLE_DRIVE_DOWNLOAD_PATH", "downloads/google-drive")
+)
 
 google_calendar_service = None
+google_drive_service = None
+google_credentials = None
 
 
 def google_calendar_error(exc: Exception) -> str:
@@ -2700,18 +2707,23 @@ def google_calendar_error(exc: Exception) -> str:
     return str(exc).strip() or exc.__class__.__name__
 
 
-def get_google_calendar_service():
-    global google_calendar_service
-
-    if google_calendar_service is not None:
-        return google_calendar_service
+def get_google_credentials():
+    global google_credentials
+    if google_credentials is not None and google_credentials.valid:
+        return google_credentials
 
     credentials = None
     if os.path.exists(GOOGLE_TOKEN):
-        credentials = Credentials.from_authorized_user_file(
-            GOOGLE_TOKEN,
-            GOOGLE_CALENDAR_SCOPES,
-        )
+        with open(GOOGLE_TOKEN, encoding="utf-8") as token_file:
+            token_data = json.load(token_file)
+        granted_scopes = token_data.get("scopes", [])
+        if isinstance(granted_scopes, str):
+            granted_scopes = granted_scopes.split()
+        if set(GOOGLE_SCOPES).issubset(granted_scopes):
+            credentials = Credentials.from_authorized_user_info(
+                token_data,
+                GOOGLE_SCOPES,
+            )
     if credentials and credentials.expired and credentials.refresh_token:
         credentials.refresh(Request())
     elif not credentials or not credentials.valid:
@@ -2721,14 +2733,30 @@ def get_google_calendar_service():
             )
         flow = InstalledAppFlow.from_client_secrets_file(
             GOOGLE_CREDENTIALS,
-            GOOGLE_CALENDAR_SCOPES,
+            GOOGLE_SCOPES,
         )
-        credentials = flow.run_local_server(port=0)
+        credentials = flow.run_local_server(port=0, access_type="offline", prompt="consent")
 
     with open(GOOGLE_TOKEN, "w", encoding="utf-8") as token_file:
         token_file.write(credentials.to_json())
-    google_calendar_service = build("calendar", "v3", credentials=credentials)
+    google_credentials = credentials
+    return google_credentials
+
+
+def get_google_calendar_service():
+    global google_calendar_service
+    if google_calendar_service is None:
+        google_calendar_service = build(
+            "calendar", "v3", credentials=get_google_credentials()
+        )
     return google_calendar_service
+
+
+def get_google_drive_service():
+    global google_drive_service
+    if google_drive_service is None:
+        google_drive_service = build("drive", "v3", credentials=get_google_credentials())
+    return google_drive_service
 
 
 def google_calendar_event(event: Dict[str, Any]) -> Dict[str, Any]:
@@ -3054,6 +3082,211 @@ def list_event_changes(
 
 
 #
+# Google Drive functionality
+#
+
+GOOGLE_NATIVE_EXPORTS = {
+    "application/vnd.google-apps.document": ("text/plain", ".txt"),
+    "application/vnd.google-apps.spreadsheet": ("text/csv", ".csv"),
+    "application/vnd.google-apps.presentation": (
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        ".pptx",
+    ),
+    "application/vnd.google-apps.drawing": ("image/png", ".png"),
+}
+
+
+def google_drive_error(exc: Exception) -> str:
+    if isinstance(exc, RefreshError):
+        return "Google authorization expired or was revoked. Delete token.json and reconnect."
+    if isinstance(exc, HttpError):
+        status = getattr(exc.resp, "status", None)
+        if status == 401:
+            return "Google Drive authentication failed. Reauthorize the account."
+        if status == 403:
+            return "Google Drive denied this operation. Enable the Drive API and check access."
+        if status == 404:
+            return "Google Drive file not found or not shared with this account."
+        return f"Google Drive API error: {exc.reason}"
+    return str(exc).strip() or exc.__class__.__name__
+
+
+def run_google_drive(operation):
+    try:
+        return operation()
+    except Exception as exc:
+        logger.warning("Google Drive operation failed: %s", exc)
+        return {"success": False, "error": google_drive_error(exc)}
+
+
+def google_drive_file(item: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "id": item.get("id", ""),
+        "name": item.get("name", ""),
+        "mime_type": item.get("mimeType", ""),
+        "size": int(item["size"]) if item.get("size") else None,
+        "created_time": item.get("createdTime", ""),
+        "modified_time": item.get("modifiedTime", ""),
+        "web_view_link": item.get("webViewLink", ""),
+        "parents": item.get("parents", []),
+        "owners": [owner.get("emailAddress", "") for owner in item.get("owners", [])],
+    }
+
+
+DRIVE_FILE_FIELDS = (
+    "id,name,mimeType,size,createdTime,modifiedTime,webViewLink,parents,"
+    "owners(emailAddress)"
+)
+
+
+@mcp.tool()
+def connect_drive() -> Dict[str, Any]:
+    """Authenticate with Google Drive using the shared Google OAuth token."""
+    def operation():
+        get_google_drive_service().files().list(pageSize=1, fields="files(id)").execute()
+        return {"success": True, "message": "Connected to Google Drive."}
+
+    return run_google_drive(operation)
+
+
+@mcp.tool()
+def drive_health() -> Dict[str, Any]:
+    """Check Google Drive authentication and API access."""
+    def operation():
+        about = get_google_drive_service().about().get(fields="user,storageQuota").execute()
+        user = about.get("user", {})
+        return {
+            "healthy": True,
+            "user": user.get("emailAddress", ""),
+            "storage_quota": about.get("storageQuota", {}),
+        }
+
+    return run_google_drive(operation)
+
+
+@mcp.tool()
+def search_drive_files(
+    query: str = "",
+    limit: int = 20,
+    mime_type: str | None = None,
+    include_trashed: bool = False,
+) -> Dict[str, Any]:
+    """Search Google Drive files by name, full text, and optional MIME type."""
+    def operation():
+        if not 1 <= limit <= 100:
+            raise ValueError("limit must be between 1 and 100")
+        clauses = []
+        if query.strip():
+            escaped = query.replace("\\", "\\\\").replace("'", "\\'")
+            clauses.append(f"(name contains '{escaped}' or fullText contains '{escaped}')")
+        if mime_type:
+            escaped_mime = mime_type.replace("'", "\\'")
+            clauses.append(f"mimeType = '{escaped_mime}'")
+        if not include_trashed:
+            clauses.append("trashed = false")
+        result = get_google_drive_service().files().list(
+            q=" and ".join(clauses) if clauses else None,
+            pageSize=limit,
+            orderBy="modifiedTime desc",
+            fields=f"nextPageToken,files({DRIVE_FILE_FIELDS})",
+        ).execute()
+        files = [google_drive_file(item) for item in result.get("files", [])]
+        return {"success": True, "count": len(files), "files": files}
+
+    return run_google_drive(operation)
+
+
+@mcp.tool()
+def get_drive_file(file_id: str) -> Dict[str, Any]:
+    """Get metadata for one Google Drive file."""
+    def operation():
+        if not file_id.strip():
+            raise ValueError("file_id is required")
+        item = get_google_drive_service().files().get(
+            fileId=file_id,
+            fields=DRIVE_FILE_FIELDS,
+        ).execute()
+        return {"success": True, "file": google_drive_file(item)}
+
+    return run_google_drive(operation)
+
+
+@mcp.tool()
+def read_drive_file(file_id: str, max_characters: int = 100000) -> Dict[str, Any]:
+    """Read a Google Doc, Sheet, or text-based Drive file as text."""
+    def operation():
+        if not 1 <= max_characters <= 1000000:
+            raise ValueError("max_characters must be between 1 and 1000000")
+        service = get_google_drive_service()
+        item = service.files().get(
+            fileId=file_id,
+            fields="id,name,mimeType,modifiedTime,webViewLink",
+        ).execute()
+        mime_type = item.get("mimeType", "")
+        if mime_type == "application/vnd.google-apps.document":
+            content = service.files().export(fileId=file_id, mimeType="text/plain").execute()
+        elif mime_type == "application/vnd.google-apps.spreadsheet":
+            content = service.files().export(fileId=file_id, mimeType="text/csv").execute()
+        elif mime_type.startswith("text/") or mime_type in {
+            "application/json",
+            "application/xml",
+        }:
+            content = service.files().get_media(fileId=file_id).execute()
+        else:
+            raise ValueError(
+                f"Unsupported readable MIME type: {mime_type}. Use download_drive_file instead."
+            )
+        text_content = content.decode("utf-8", errors="replace")
+        return {
+            "success": True,
+            "file": google_drive_file(item),
+            "content": text_content[:max_characters],
+            "truncated": len(text_content) > max_characters,
+        }
+
+    return run_google_drive(operation)
+
+
+@mcp.tool()
+def download_drive_file(file_id: str, filename: str | None = None) -> Dict[str, Any]:
+    """Download or export a Google Drive file to the configured download folder."""
+    def operation():
+        service = get_google_drive_service()
+        item = service.files().get(fileId=file_id, fields="id,name,mimeType").execute()
+        mime_type = item.get("mimeType", "")
+        source_name = filename or item.get("name") or file_id
+        if mime_type in GOOGLE_NATIVE_EXPORTS:
+            export_type, extension = GOOGLE_NATIVE_EXPORTS[mime_type]
+            request = service.files().export_media(fileId=file_id, mimeType=export_type)
+            if not Path(source_name).suffix:
+                source_name += extension
+        elif mime_type.startswith("application/vnd.google-apps"):
+            raise ValueError(f"Unsupported Google-native MIME type: {mime_type}")
+        else:
+            request = service.files().get_media(fileId=file_id)
+
+        safe_name = re.sub(r"[^A-Za-z0-9._ -]", "_", Path(source_name).name).strip()
+        if not safe_name:
+            raise ValueError("filename must contain valid characters")
+        GOOGLE_DRIVE_DOWNLOAD_PATH.mkdir(parents=True, exist_ok=True)
+        destination = GOOGLE_DRIVE_DOWNLOAD_PATH / safe_name
+        buffer = BytesIO()
+        downloader = MediaIoBaseDownload(buffer, request)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
+        destination.write_bytes(buffer.getvalue())
+        return {
+            "success": True,
+            "file_id": file_id,
+            "path": str(destination.resolve()),
+            "size": destination.stat().st_size,
+        }
+
+    return run_google_drive(operation)
+
+
+#
 # Email functionality
 #
 
@@ -3061,9 +3294,9 @@ EMAIL_PROVIDER = os.getenv("EMAIL_PROVIDER", "gmail")
 EMAIL_ADDRESS = os.getenv("EMAIL_ADDRESS", "")
 EMAIL_SECRET = os.getenv("EMAIL_SECRET", "")
 IMAP_HOST = os.getenv("IMAP_HOST", "imap.gmail.com")
-IMAP_PORT = int(os.getenv("IMAP_PORT", "993"))
+IMAP_PORT = os.getenv("IMAP_PORT", "993")
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
-SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))
+SMTP_PORT = os.getenv("SMTP_PORT", "465")
 
 email_imap_connection: imaplib.IMAP4_SSL | None = None
 
@@ -3094,7 +3327,17 @@ def email_configuration_error() -> str | None:
         if not value
     ]
     if missing:
-        return f"Missing environment variables: {', '.join(missing)}"
+        return (
+            f"Missing environment variables: {', '.join(missing)}. "
+            "Run `python setup_env.py` and configure Email."
+        )
+    for name, value in {"IMAP_PORT": IMAP_PORT, "SMTP_PORT": SMTP_PORT}.items():
+        try:
+            port = int(value)
+        except ValueError:
+            return f"{name} must be a number. Run `python setup_env.py` to fix it."
+        if not 1 <= port <= 65535:
+            return f"{name} must be between 1 and 65535."
     return None
 
 
@@ -3113,8 +3356,9 @@ def open_email_imap() -> imaplib.IMAP4_SSL:
         except (imaplib.IMAP4.error, OSError):
             email_imap_connection = None
 
-    logger.info("Connecting to IMAP server %s:%s", IMAP_HOST, IMAP_PORT)
-    connection = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT, timeout=30)
+    imap_port = int(IMAP_PORT)
+    logger.info("Connecting to IMAP server %s:%s", IMAP_HOST, imap_port)
+    connection = imaplib.IMAP4_SSL(IMAP_HOST, imap_port, timeout=30)
     connection.login(EMAIL_ADDRESS, EMAIL_SECRET)
     email_imap_connection = connection
     return connection
@@ -3446,7 +3690,7 @@ def send_email(
         else:
             message.set_content(body)
 
-        with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=30) as smtp:
+        with smtplib.SMTP_SSL(SMTP_HOST, int(SMTP_PORT), timeout=30) as smtp:
             smtp.login(EMAIL_ADDRESS, EMAIL_SECRET)
             smtp.send_message(message)
         return {"success": True, "message": "Email sent successfully."}
@@ -3526,10 +3770,17 @@ def summarize_email(message_id: str) -> Dict[str, Any]:
 
 
 def main() -> None:
+    def stop_server(signum, frame) -> None:
+        close_email_imap()
+        print("\nMCP server stopped.", file=sys.stderr, flush=True)
+        os._exit(130)
+
+    signal.signal(signal.SIGINT, stop_server)
     try:
+        print("MCP server running. Press Ctrl+C to stop.", file=sys.stderr, flush=True)
         mcp.run()
     except KeyboardInterrupt:
-        logger.info("MCP server stopped")
+        stop_server(signal.SIGINT, None)
     finally:
         close_email_imap()
 
