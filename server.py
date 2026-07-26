@@ -32,6 +32,7 @@ import logging
 import signal
 import smtplib
 import sys
+import zlib
 from email.header import decode_header, make_header
 from email.message import EmailMessage, Message
 from uuid import uuid4
@@ -194,6 +195,7 @@ mcp = FastMCP(
 DOWNLOADS_PATH = Path(__file__).resolve().parent / "downloads"
 STORAGE_PATH = DOWNLOADS_PATH / "arxiv"
 CHART_STORAGE_PATH = DOWNLOADS_PATH / "charts"
+PLANTUML_STORAGE_PATH = DOWNLOADS_PATH / "plantuml"
 
 #
 # SQL Database functionality
@@ -3145,6 +3147,106 @@ def create_exchange_rate_chart(
         "maximum_rate": max(values),
         "latest_rate": float(values.iloc[-1]),
         **details,
+    }
+    return [metadata, Image(path=path)]
+
+
+#
+# PlantUML rendering functionality
+#
+
+PLANTUML_SERVER = "https://www.plantuml.com/plantuml"
+PLANTUML_MAX_SOURCE_BYTES = 256 * 1024
+PLANTUML_MAX_OUTPUT_BYTES = 10 * 1024 * 1024
+
+
+def plantuml_encode6bit(value: int) -> str:
+    if value < 10:
+        return chr(48 + value)
+    value -= 10
+    if value < 26:
+        return chr(65 + value)
+    value -= 26
+    if value < 26:
+        return chr(97 + value)
+    return "-" if value == 26 else "_"
+
+
+def plantuml_append3bytes(first: int, second: int, third: int) -> str:
+    values = (
+        first >> 2,
+        ((first & 0x3) << 4) | (second >> 4),
+        ((second & 0xF) << 2) | (third >> 6),
+        third & 0x3F,
+    )
+    return "".join(plantuml_encode6bit(value & 0x3F) for value in values)
+
+
+def plantuml_encode(source: str) -> str:
+    compressor = zlib.compressobj(level=9, wbits=-15)
+    data = compressor.compress(source.encode("utf-8")) + compressor.flush()
+    encoded = []
+    for index in range(0, len(data), 3):
+        chunk = data[index : index + 3]
+        encoded.append(
+            plantuml_append3bytes(
+                chunk[0],
+                chunk[1] if len(chunk) > 1 else 0,
+                chunk[2] if len(chunk) > 2 else 0,
+            )
+        )
+    return "".join(encoded)
+
+
+@mcp.tool()
+def render_plantuml(source: str, filename: str = "diagram.png") -> List[Any]:
+    """Render PlantUML source as PNG using the official PlantUML Server.
+
+    Preserve the source exactly as supplied. The source must include @startuml and @enduml.
+    """
+    if not source.strip():
+        raise ValueError("source cannot be empty")
+    if "@startuml" not in source.lower():
+        raise ValueError("source must contain @startuml")
+    if "@enduml" not in source.lower():
+        raise ValueError("source must contain @enduml")
+    if len(source.encode("utf-8")) > PLANTUML_MAX_SOURCE_BYTES:
+        raise ValueError("source exceeds the 256 KiB limit")
+
+    url = f"{PLANTUML_SERVER}/png/{plantuml_encode(source)}"
+    try:
+        response = httpx.get(url, timeout=30.0)
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        details = (
+            exc.response.headers.get("x-plantuml-diagram-description")
+            or exc.response.headers.get("x-plantuml-diagram-error")
+            or f"HTTP {exc.response.status_code}"
+        )
+        raise ValueError(f"PlantUML rendering failed: {details}") from exc
+    except httpx.RequestError as exc:
+        raise ConnectionError(f"Could not reach the official PlantUML Server: {exc}") from exc
+
+    content_type = response.headers.get("content-type", "").split(";", 1)[0]
+    if content_type != "image/png":
+        raise ValueError(f"PlantUML rendering failed: unexpected content type {content_type}")
+    if response.headers.get("x-plantuml-diagram-error"):
+        raise ValueError("PlantUML rendering failed because the source contains a syntax error")
+    if len(response.content) > PLANTUML_MAX_OUTPUT_BYTES:
+        raise ValueError("Rendered PNG exceeds the 10 MiB limit")
+
+    safe_filename = re.sub(r"[^A-Za-z0-9._-]+", "-", filename).strip("-") or "diagram.png"
+    if not safe_filename.lower().endswith(".png"):
+        safe_filename += ".png"
+    PLANTUML_STORAGE_PATH.mkdir(parents=True, exist_ok=True)
+    path = PLANTUML_STORAGE_PATH / safe_filename
+    path.write_bytes(response.content)
+    metadata = {
+        "success": True,
+        "file_path": str(path),
+        "mime_type": "image/png",
+        "size_bytes": len(response.content),
+        "server": PLANTUML_SERVER,
     }
     return [metadata, Image(path=path)]
 

@@ -35,6 +35,12 @@ returns it as MCP image content. arXiv papers are stored under `downloads/arxiv`
 CSV or Excel files, with labels, annotations, summary statistics, and source notes.
 Use `inspect_data_file` first to discover sheets, columns, data types, and sample rows.
 
+## PlantUML
+
+`render_plantuml` renders source containing `@startuml` and `@enduml` as PNG
+through the official PlantUML Server. Results are saved under
+`downloads/plantuml` and returned as MCP image content for Telegram delivery.
+
 ## Email configuration
 
 Email tools use IMAP and SMTP settings from `.env`. For Gmail, use a Google
