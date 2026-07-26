@@ -1,4 +1,4 @@
-from mcp.server.fastmcp import FastMCP, Context
+from mcp.server.fastmcp import FastMCP, Context, Image
 from typing import List, Dict, Any, Optional, AsyncIterator
 import nbformat
 from dataclasses import dataclass
@@ -8,6 +8,9 @@ import re
 import PyPDF2
 import gnews
 import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 from sqlalchemy import create_engine, text, inspect
 from tavily import TavilyClient
 from dotenv import load_dotenv
@@ -187,8 +190,10 @@ mcp = FastMCP(
     lifespan=app_lifespan
 )
 
-# ArXiv storage path configuration
-STORAGE_PATH = Path(os.getenv("ARXIV_PAPER_STORAGE_PATH", str(Path.cwd() / "downloads")))
+# Generated files stay together under the repository's ignored downloads directory.
+DOWNLOADS_PATH = Path(__file__).resolve().parent / "downloads"
+STORAGE_PATH = DOWNLOADS_PATH / "arxiv"
+CHART_STORAGE_PATH = DOWNLOADS_PATH / "charts"
 
 #
 # SQL Database functionality
@@ -2871,6 +2876,277 @@ def get_exchange_rate_history(
         "count": len(rates),
         "rates": rates,
     }
+
+
+def render_data_chart(
+    data: pd.DataFrame,
+    x_column: str,
+    y_columns: List[str],
+    chart_type: str,
+    title: str,
+    x_label: str | None,
+    y_label: str | None,
+    source_note: str | None,
+    filename: str,
+    dpi: int,
+    annotate: bool,
+) -> tuple[Path, Dict[str, Any]]:
+    if chart_type not in {"line", "bar", "scatter"}:
+        raise ValueError("chart_type must be line, bar, or scatter")
+    if not 120 <= dpi <= 400:
+        raise ValueError("dpi must be between 120 and 400")
+    missing = [column for column in [x_column, *y_columns] if column not in data.columns]
+    if missing:
+        raise ValueError(f"Columns not found: {', '.join(missing)}")
+    if not y_columns:
+        raise ValueError("At least one y column is required")
+
+    frame = data[[x_column, *y_columns]].dropna(subset=[x_column]).copy()
+    if frame.empty:
+        raise ValueError("No rows remain after removing empty x values")
+    for column in y_columns:
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    frame = frame.dropna(subset=y_columns, how="all")
+    if frame.empty:
+        raise ValueError("Selected y columns contain no numeric values")
+
+    x_values = frame[x_column]
+    if not pd.api.types.is_numeric_dtype(x_values):
+        parsed_dates = pd.to_datetime(x_values, errors="coerce")
+        if parsed_dates.notna().all():
+            x_values = parsed_dates
+
+    fig, ax = plt.subplots(figsize=(11, 6.2))
+    colors = ["#2563eb", "#dc2626", "#059669", "#d97706", "#7c3aed"]
+    width = 0.8 / len(y_columns)
+    positions = list(range(len(frame)))
+
+    for index, column in enumerate(y_columns):
+        values = frame[column]
+        color = colors[index % len(colors)]
+        if chart_type == "line":
+            ax.plot(x_values, values, label=column, color=color, linewidth=2.3, marker="o", markersize=3.5)
+        elif chart_type == "scatter":
+            ax.scatter(x_values, values, label=column, color=color, s=38, alpha=0.85)
+        else:
+            offsets = [position + (index - (len(y_columns) - 1) / 2) * width for position in positions]
+            bars = ax.bar(offsets, values, width=width, label=column, color=color, alpha=0.9)
+            if annotate and len(frame) <= 30:
+                ax.bar_label(bars, fmt="%g", padding=3, fontsize=8)
+
+        if annotate and chart_type != "bar" and len(frame) <= 30:
+            valid = values.dropna()
+            for row_index in {valid.index[0], valid.index[-1]} if not valid.empty else set():
+                x_value = x_values.loc[row_index]
+                y_value = values.loc[row_index]
+                ax.annotate(
+                    f"{y_value:,.4g}",
+                    (x_value, y_value),
+                    xytext=(5, 7),
+                    textcoords="offset points",
+                    fontsize=8,
+                    color=color,
+                )
+
+    if chart_type == "bar":
+        ax.set_xticks(positions, [str(value) for value in frame[x_column]], rotation=30, ha="right")
+    ax.set_title(title, fontsize=16, fontweight="bold", loc="left", pad=18)
+    ax.set_xlabel(x_label or x_column)
+    ax.set_ylabel(y_label or "Value")
+    ax.grid(axis="y", alpha=0.22, linestyle="--")
+    ax.spines[["top", "right"]].set_visible(False)
+    if len(y_columns) > 1:
+        ax.legend(frameon=False, ncol=min(len(y_columns), 3))
+
+    statistics = {
+        column: {
+            "minimum": float(frame[column].min()),
+            "maximum": float(frame[column].max()),
+            "average": float(frame[column].mean()),
+            "latest": float(frame[column].dropna().iloc[-1]),
+        }
+        for column in y_columns
+        if frame[column].notna().any()
+    }
+    summary = "\n".join(
+        f"{column}: min {stats['minimum']:,.4g} | avg {stats['average']:,.4g} | max {stats['maximum']:,.4g}"
+        for column, stats in statistics.items()
+    )
+    ax.text(
+        0,
+        -0.19,
+        summary,
+        transform=ax.transAxes,
+        fontsize=8.5,
+        color="#374151",
+        va="top",
+    )
+    if source_note:
+        fig.text(0.99, 0.01, source_note, ha="right", fontsize=8, color="#6b7280")
+
+    CHART_STORAGE_PATH.mkdir(parents=True, exist_ok=True)
+    safe_filename = re.sub(r"[^A-Za-z0-9._-]+", "-", filename).strip("-") or "chart.png"
+    if not safe_filename.lower().endswith(".png"):
+        safe_filename += ".png"
+    path = CHART_STORAGE_PATH / safe_filename
+    fig.autofmt_xdate()
+    fig.tight_layout(rect=(0, 0.1, 1, 1))
+    fig.savefig(path, dpi=dpi, format="png", bbox_inches="tight")
+    plt.close(fig)
+    return path, {"rows": len(frame), "statistics": statistics}
+
+
+def load_tabular_file(file_path: str, sheet_name: str | None = None) -> tuple[Path, pd.DataFrame]:
+    path = Path(file_path).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"Data file not found: {path}")
+    suffix = path.suffix.lower()
+    if suffix == ".csv":
+        return path, pd.read_csv(path)
+    if suffix in {".xlsx", ".xlsm"}:
+        return path, pd.read_excel(path, sheet_name=sheet_name or 0)
+    raise ValueError("file_path must be a CSV, XLSX, or XLSM file")
+
+
+@mcp.tool()
+def inspect_data_file(
+    file_path: str,
+    sheet_name: str | None = None,
+    preview_rows: int = 5,
+) -> Dict[str, Any]:
+    """Inspect a CSV or Excel file before analysis or charting.
+
+    Returns sheet names, columns, inferred data types, dimensions, and a small row preview.
+    """
+    if not 1 <= preview_rows <= 20:
+        raise ValueError("preview_rows must be between 1 and 20")
+    path = Path(file_path).expanduser().resolve()
+    sheet_names = None
+    if path.suffix.lower() in {".xlsx", ".xlsm"}:
+        if not path.is_file():
+            raise FileNotFoundError(f"Data file not found: {path}")
+        sheet_names = pd.ExcelFile(path).sheet_names
+    path, data = load_tabular_file(str(path), sheet_name)
+    preview = data.head(preview_rows).where(pd.notna(data), None).to_dict(orient="records")
+    return {
+        "file_path": str(path),
+        "sheet_names": sheet_names,
+        "selected_sheet": sheet_name or (sheet_names[0] if sheet_names else None),
+        "row_count": len(data),
+        "column_count": len(data.columns),
+        "columns": [str(column) for column in data.columns],
+        "data_types": {str(column): str(dtype) for column, dtype in data.dtypes.items()},
+        "preview": preview,
+    }
+
+
+@mcp.tool()
+def create_data_chart(
+    file_path: str,
+    x_column: str,
+    y_columns: List[str],
+    chart_type: str = "line",
+    title: str | None = None,
+    x_label: str | None = None,
+    y_label: str | None = None,
+    source_note: str | None = None,
+    sheet_name: str | None = None,
+    filename: str = "data-chart.png",
+    dpi: int = 200,
+    annotate: bool = True,
+) -> list[Any]:
+    """Create an informative high-DPI PNG chart from selected CSV or Excel columns.
+
+    Choose columns that answer the user's question. Prefer an explicit title and axis labels,
+    retain annotations unless the chart is dense, and include a short source_note when known.
+    """
+    path, data = load_tabular_file(file_path, sheet_name)
+
+    chart_path, details = render_data_chart(
+        data,
+        x_column,
+        y_columns,
+        chart_type,
+        title or f"{', '.join(y_columns)} by {x_column}",
+        x_label,
+        y_label,
+        source_note or f"Source: {path.name}",
+        filename,
+        dpi,
+        annotate,
+    )
+    metadata = {
+        "success": True,
+        "file_path": str(chart_path),
+        "mime_type": "image/png",
+        "chart_type": chart_type,
+        "x_column": x_column,
+        "y_columns": y_columns,
+        "dpi": dpi,
+        **details,
+    }
+    return [metadata, Image(path=chart_path)]
+
+
+@mcp.tool()
+def create_exchange_rate_chart(
+    base: str,
+    quote: str,
+    start_date: str,
+    end_date: str,
+    group: str | None = None,
+    providers: str | None = None,
+    title: str | None = None,
+) -> list[Any]:
+    """Create and save a PNG line chart for an exchange-rate time series."""
+    history = get_exchange_rate_history(
+        base,
+        quote,
+        start_date,
+        end_date,
+        group,
+        providers,
+        False,
+    )
+    if not history["rates"]:
+        raise ValueError("No exchange-rate data found for the requested range")
+
+    chart_title = title or f"{history['base']} to {history['quote']} exchange rate"
+    filename = (
+        f"{history['base']}-{history['quote']}_"
+        f"{history['start_date']}_{history['end_date']}.png"
+    )
+    data = pd.DataFrame(history["rates"])
+    path, details = render_data_chart(
+        data,
+        "date",
+        ["rate"],
+        "line",
+        chart_title,
+        "Date",
+        f"{history['quote']} per 1 {history['base']}",
+        "Source: Frankfurter API",
+        filename,
+        200,
+        True,
+    )
+    values = data["rate"]
+
+    metadata = {
+        "success": True,
+        "file_path": str(path.resolve()),
+        "mime_type": "image/png",
+        "base": history["base"],
+        "quote": history["quote"],
+        "start_date": history["start_date"],
+        "end_date": history["end_date"],
+        "data_points": history["count"],
+        "minimum_rate": min(values),
+        "maximum_rate": max(values),
+        "latest_rate": float(values.iloc[-1]),
+        **details,
+    }
+    return [metadata, Image(path=path)]
 
 
 #

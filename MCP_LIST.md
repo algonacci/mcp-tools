@@ -24,7 +24,8 @@ notebook reading (`read_pdf`, `read_excel`, `read_notebook`), Wikipedia (`summar
   (`search_weather_locations`, `get_current_weather`, `get_hourly_forecast`,
   `get_daily_forecast`), and Frankfurter currencies (`list_currencies`, `get_currency`,
   `list_exchange_rate_providers`, `get_rates`, `get_exchange_rate`, `convert_currency`,
-  `get_exchange_rate_history`).
+  `get_exchange_rate_history`, `create_exchange_rate_chart`), and general CSV/Excel charting
+  (`inspect_data_file`, `create_data_chart`).
 
 ## High priority — personal assistant essentials
 
