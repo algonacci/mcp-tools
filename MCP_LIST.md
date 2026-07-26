@@ -14,19 +14,21 @@ notebook reading (`read_pdf`, `read_excel`, `read_notebook`), Wikipedia (`summar
 `random`, `set_lang`), academic papers (`search_papers`, `download_paper`, `search_garuda`,
 `get_garuda_detail`, `search_ieee`, `search_sciencedirect`), and crypto/market data (`get_price`,
 `get_coin_detail`, `get_top_coins`, `search_coin`, `get_global_market`, `get_price_history`,
-`compare_coins`).
+`compare_coins`), and email (`connect`, `health`, `list_folders`, `latest_emails`, `read_email`,
+`search_emails`, `send_email`, `mark_read`, `mark_unread`, `delete_email`, `list_attachments`,
+`summarize_email`), and Google Calendar (`connect_calendar`, `calendar_health`, `list_calendars`,
+`list_events`, `get_event`, `create_event`, `update_event`, `delete_event`, `list_calendar_acl`,
+`share_calendar`, `watch_calendar_events`, `list_event_changes`).
 
 ## High priority — personal assistant essentials
 
-- [ ] **Gmail** — read recent messages, search by sender/subject/label, send a draft or reply. This
-  was the original motivation for this list: reading email is a clear MCP capability, not
-  something Kumo should ever implement natively. A read-only pass (list/search/read) is safer to
-  ship first; sending mail should probably require the same kind of explicit confirmation Kumo
-  already asks for on `run_command`, since a Kumo tool call maps 1:1 to an MCP call with no
-  in-between review by this server.
-- [ ] **Google Calendar** — list upcoming events, check free/busy for a time range, create an
-  event. Read-only listing first; creating/deleting events is the side-effecting half and should
-  be treated with the same care as sending email.
+- [x] **Email (Gmail MVP)** — read recent messages, search by sender/subject/date, inspect
+  attachments, manage read flags, delete messages, and send plain-text or HTML email over IMAP
+  and SMTP. Kumo should require explicit confirmation before calling `send_email` or
+  `delete_email`, since these calls have immediate external side effects.
+- [x] **Google Calendar** — list and search events, inspect details, create/update/delete events,
+  add Google Meet links, manage ACL sharing, watch changes, and use incremental sync tokens.
+  Kumo should require confirmation before write operations.
 - [ ] **Google Drive / Docs** — search files by name, read a Doc's or Sheet's content as text.
   Useful once Gmail/Calendar exist, since a lot of personal workflows touch all three together.
 

@@ -22,8 +22,23 @@ from urllib.parse import urljoin
 from playwright.async_api import async_playwright, Page
 from playwright_stealth import Stealth
 from bs4 import BeautifulSoup
+import email
+import imaplib
+import logging
+import smtplib
+from email.header import decode_header, make_header
+from email.message import EmailMessage, Message
+from uuid import uuid4
+from google.auth.exceptions import RefreshError
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 # Load environment variables
 load_dotenv()
+
+logger = logging.getLogger("mcp-tools")
 
 # =========================
 # Notebook Parsing Utils
@@ -144,7 +159,7 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[ServerContext]:
             tavily_client=tavily_client
         )
     finally:
-        pass  # No cleanup needed
+        close_email_imap()
 
 # Configure FastMCP with dependencies and lifespan
 mcp = FastMCP(
@@ -166,7 +181,9 @@ mcp = FastMCP(
         "playwright-stealth",
         "nbformat",
         "beautifulsoup4",
-        "lxml"
+        "lxml",
+        "google-api-python-client",
+        "google-auth-oauthlib",
     ],
     lifespan=app_lifespan
 )
@@ -2652,7 +2669,871 @@ async def compare_coins(
     ]
 
 
+#
+# Google Calendar functionality
+#
+
+GOOGLE_CALENDAR_SCOPES = ["https://www.googleapis.com/auth/calendar"]
+GOOGLE_CREDENTIALS = os.getenv("GOOGLE_CREDENTIALS", "credentials.json")
+GOOGLE_TOKEN = os.getenv("GOOGLE_TOKEN", "token.json")
+GOOGLE_CALENDAR_TIMEZONE = os.getenv("GOOGLE_CALENDAR_TIMEZONE", "Asia/Jakarta")
+
+google_calendar_service = None
+
+
+def google_calendar_error(exc: Exception) -> str:
+    if isinstance(exc, RefreshError):
+        return "Google authorization expired or was revoked. Delete token.json and reconnect."
+    if isinstance(exc, HttpError):
+        status = getattr(exc.resp, "status", None)
+        if status == 400:
+            return f"Google Calendar rejected the request: {exc.reason}"
+        if status == 401:
+            return "Google Calendar authentication failed. Reauthorize the account."
+        if status == 403:
+            return "Google Calendar denied this operation. Check account permissions and API access."
+        if status == 404:
+            return "Calendar or event not found."
+        if status == 410:
+            return "The sync token expired. Run list_events again to obtain a new sync token."
+        return f"Google Calendar API error: {exc.reason}"
+    return str(exc).strip() or exc.__class__.__name__
+
+
+def get_google_calendar_service():
+    global google_calendar_service
+
+    if google_calendar_service is not None:
+        return google_calendar_service
+
+    credentials = None
+    if os.path.exists(GOOGLE_TOKEN):
+        credentials = Credentials.from_authorized_user_file(
+            GOOGLE_TOKEN,
+            GOOGLE_CALENDAR_SCOPES,
+        )
+    if credentials and credentials.expired and credentials.refresh_token:
+        credentials.refresh(Request())
+    elif not credentials or not credentials.valid:
+        if not os.path.exists(GOOGLE_CREDENTIALS):
+            raise FileNotFoundError(
+                f"Google OAuth credentials not found: {GOOGLE_CREDENTIALS}"
+            )
+        flow = InstalledAppFlow.from_client_secrets_file(
+            GOOGLE_CREDENTIALS,
+            GOOGLE_CALENDAR_SCOPES,
+        )
+        credentials = flow.run_local_server(port=0)
+
+    with open(GOOGLE_TOKEN, "w", encoding="utf-8") as token_file:
+        token_file.write(credentials.to_json())
+    google_calendar_service = build("calendar", "v3", credentials=credentials)
+    return google_calendar_service
+
+
+def google_calendar_event(event: Dict[str, Any]) -> Dict[str, Any]:
+    start = event.get("start", {})
+    end = event.get("end", {})
+    entry_points = event.get("conferenceData", {}).get("entryPoints", [])
+    meet_url = next(
+        (item.get("uri") for item in entry_points if item.get("entryPointType") == "video"),
+        event.get("hangoutLink", ""),
+    )
+    return {
+        "id": event.get("id", ""),
+        "summary": event.get("summary", "(no title)"),
+        "description": event.get("description", ""),
+        "location": event.get("location", ""),
+        "start": start.get("dateTime") or start.get("date"),
+        "end": end.get("dateTime") or end.get("date"),
+        "status": event.get("status", ""),
+        "html_link": event.get("htmlLink", ""),
+        "meet_url": meet_url or "",
+        "attendees": [item.get("email", "") for item in event.get("attendees", [])],
+        "attachments": [
+            {"title": item.get("title", ""), "file_url": item.get("fileUrl", "")}
+            for item in event.get("attachments", [])
+        ],
+    }
+
+
+def google_event_time(value: str, time_zone: str) -> Dict[str, str]:
+    if not value.strip():
+        raise ValueError("Event date-time cannot be empty")
+    return {"dateTime": value, "timeZone": time_zone}
+
+
+def run_google_calendar(operation):
+    try:
+        return operation()
+    except Exception as exc:
+        logger.warning("Google Calendar operation failed: %s", exc)
+        return {"success": False, "error": google_calendar_error(exc)}
+
+
+@mcp.tool()
+def connect_calendar() -> Dict[str, Any]:
+    """Authenticate with Google Calendar and cache the API client."""
+    def operation():
+        get_google_calendar_service().calendarList().list(maxResults=1).execute()
+        return {"success": True, "message": "Connected to Google Calendar."}
+
+    return run_google_calendar(operation)
+
+
+@mcp.tool()
+def calendar_health() -> Dict[str, Any]:
+    """Check whether Google Calendar authentication and API access work."""
+    def operation():
+        calendar = get_google_calendar_service().calendars().get(
+            calendarId="primary"
+        ).execute()
+        return {
+            "healthy": True,
+            "calendar": calendar.get("summary", "primary"),
+            "time_zone": calendar.get("timeZone", GOOGLE_CALENDAR_TIMEZONE),
+        }
+
+    return run_google_calendar(operation)
+
+
+@mcp.tool()
+def list_calendars() -> Dict[str, Any]:
+    """List calendars visible to the authenticated Google account."""
+    def operation():
+        result = get_google_calendar_service().calendarList().list().execute()
+        calendars = [
+            {
+                "id": item.get("id", ""),
+                "summary": item.get("summary", ""),
+                "primary": item.get("primary", False),
+                "access_role": item.get("accessRole", ""),
+                "time_zone": item.get("timeZone", ""),
+            }
+            for item in result.get("items", [])
+        ]
+        return {"success": True, "count": len(calendars), "calendars": calendars}
+
+    return run_google_calendar(operation)
+
+
+@mcp.tool()
+def list_events(
+    calendar_id: str = "primary",
+    limit: int = 10,
+    time_min: str | None = None,
+    time_max: str | None = None,
+    query: str | None = None,
+) -> Dict[str, Any]:
+    """List upcoming events with optional time range and free-text search."""
+    def operation():
+        if not 1 <= limit <= 250:
+            raise ValueError("limit must be between 1 and 250")
+        params = {
+            "calendarId": calendar_id,
+            "timeMin": time_min or datetime.now(timezone.utc).isoformat(),
+            "maxResults": limit,
+            "singleEvents": True,
+            "orderBy": "startTime",
+        }
+        if time_max:
+            params["timeMax"] = time_max
+        if query:
+            params["q"] = query
+        result = get_google_calendar_service().events().list(**params).execute()
+        events = [google_calendar_event(item) for item in result.get("items", [])]
+        return {
+            "success": True,
+            "count": len(events),
+            "events": events,
+            "next_sync_token": result.get("nextSyncToken"),
+        }
+
+    return run_google_calendar(operation)
+
+
+@mcp.tool()
+def get_event(event_id: str, calendar_id: str = "primary") -> Dict[str, Any]:
+    """Get details for one Google Calendar event."""
+    def operation():
+        if not event_id.strip():
+            raise ValueError("event_id is required")
+        event = get_google_calendar_service().events().get(
+            calendarId=calendar_id,
+            eventId=event_id,
+        ).execute()
+        return {"success": True, "event": google_calendar_event(event)}
+
+    return run_google_calendar(operation)
+
+
+@mcp.tool()
+def create_event(
+    summary: str,
+    start: str,
+    end: str,
+    calendar_id: str = "primary",
+    description: str | None = None,
+    location: str | None = None,
+    attendees: List[str] | None = None,
+    time_zone: str = GOOGLE_CALENDAR_TIMEZONE,
+    recurrence: List[str] | None = None,
+    send_updates: str = "none",
+    add_google_meet: bool = False,
+) -> Dict[str, Any]:
+    """Create a timed event, optionally with attendees, recurrence, and Google Meet."""
+    def operation():
+        if not summary.strip():
+            raise ValueError("summary is required")
+        if send_updates not in {"all", "externalOnly", "none"}:
+            raise ValueError("send_updates must be all, externalOnly, or none")
+        body = {
+            "summary": summary,
+            "start": google_event_time(start, time_zone),
+            "end": google_event_time(end, time_zone),
+        }
+        if description:
+            body["description"] = description
+        if location:
+            body["location"] = location
+        if attendees:
+            body["attendees"] = [{"email": address} for address in attendees]
+        if recurrence:
+            body["recurrence"] = recurrence
+        if add_google_meet:
+            body["conferenceData"] = {"createRequest": {"requestId": str(uuid4())}}
+        event = get_google_calendar_service().events().insert(
+            calendarId=calendar_id,
+            body=body,
+            sendUpdates=send_updates,
+            conferenceDataVersion=1 if add_google_meet else 0,
+        ).execute()
+        return {"success": True, "event": google_calendar_event(event)}
+
+    return run_google_calendar(operation)
+
+
+@mcp.tool()
+def update_event(
+    event_id: str,
+    calendar_id: str = "primary",
+    summary: str | None = None,
+    start: str | None = None,
+    end: str | None = None,
+    description: str | None = None,
+    location: str | None = None,
+    time_zone: str = GOOGLE_CALENDAR_TIMEZONE,
+    send_updates: str = "none",
+) -> Dict[str, Any]:
+    """Update selected fields of an existing Google Calendar event."""
+    def operation():
+        if not event_id.strip():
+            raise ValueError("event_id is required")
+        service = get_google_calendar_service()
+        event = service.events().get(calendarId=calendar_id, eventId=event_id).execute()
+        for key, value in {
+            "summary": summary,
+            "description": description,
+            "location": location,
+        }.items():
+            if value is not None:
+                event[key] = value
+        if start is not None:
+            event["start"] = google_event_time(start, time_zone)
+        if end is not None:
+            event["end"] = google_event_time(end, time_zone)
+        updated = service.events().update(
+            calendarId=calendar_id,
+            eventId=event_id,
+            body=event,
+            sendUpdates=send_updates,
+        ).execute()
+        return {"success": True, "event": google_calendar_event(updated)}
+
+    return run_google_calendar(operation)
+
+
+@mcp.tool()
+def delete_event(
+    event_id: str,
+    calendar_id: str = "primary",
+    send_updates: str = "none",
+) -> Dict[str, Any]:
+    """Permanently delete a Google Calendar event."""
+    def operation():
+        if not event_id.strip():
+            raise ValueError("event_id is required")
+        get_google_calendar_service().events().delete(
+            calendarId=calendar_id,
+            eventId=event_id,
+            sendUpdates=send_updates,
+        ).execute()
+        return {"success": True, "event_id": event_id, "message": "Event deleted."}
+
+    return run_google_calendar(operation)
+
+
+@mcp.tool()
+def list_calendar_acl(calendar_id: str = "primary") -> Dict[str, Any]:
+    """List access-control rules for a Google Calendar."""
+    def operation():
+        result = get_google_calendar_service().acl().list(calendarId=calendar_id).execute()
+        rules = [
+            {"id": item.get("id", ""), "scope": item.get("scope", {}), "role": item.get("role", "")}
+            for item in result.get("items", [])
+        ]
+        return {"success": True, "count": len(rules), "rules": rules}
+
+    return run_google_calendar(operation)
+
+
+@mcp.tool()
+def share_calendar(
+    email_address: str,
+    role: str = "reader",
+    calendar_id: str = "primary",
+) -> Dict[str, Any]:
+    """Share a Google Calendar with another account."""
+    def operation():
+        if role not in {"none", "freeBusyReader", "reader", "writer", "owner"}:
+            raise ValueError("Invalid ACL role")
+        result = get_google_calendar_service().acl().insert(
+            calendarId=calendar_id,
+            body={"scope": {"type": "user", "value": email_address}, "role": role},
+        ).execute()
+        return {"success": True, "rule_id": result.get("id"), "role": result.get("role")}
+
+    return run_google_calendar(operation)
+
+
+@mcp.tool()
+def watch_calendar_events(
+    webhook_url: str,
+    calendar_id: str = "primary",
+    channel_id: str | None = None,
+) -> Dict[str, Any]:
+    """Create a Google push-notification channel for event changes."""
+    def operation():
+        if not webhook_url.startswith("https://"):
+            raise ValueError("webhook_url must use HTTPS")
+        channel = get_google_calendar_service().events().watch(
+            calendarId=calendar_id,
+            body={
+                "id": channel_id or str(uuid4()),
+                "type": "web_hook",
+                "address": webhook_url,
+            },
+        ).execute()
+        return {"success": True, "channel": channel}
+
+    return run_google_calendar(operation)
+
+
+@mcp.tool()
+def list_event_changes(
+    sync_token: str,
+    calendar_id: str = "primary",
+) -> Dict[str, Any]:
+    """List changes since a previously returned Google Calendar sync token."""
+    def operation():
+        if not sync_token.strip():
+            raise ValueError("sync_token is required")
+        result = get_google_calendar_service().events().list(
+            calendarId=calendar_id,
+            syncToken=sync_token,
+        ).execute()
+        events = [google_calendar_event(item) for item in result.get("items", [])]
+        return {
+            "success": True,
+            "count": len(events),
+            "events": events,
+            "next_sync_token": result.get("nextSyncToken"),
+        }
+
+    return run_google_calendar(operation)
+
+
+#
+# Email functionality
+#
+
+EMAIL_PROVIDER = os.getenv("EMAIL_PROVIDER", "gmail")
+EMAIL_ADDRESS = os.getenv("EMAIL_ADDRESS", "")
+EMAIL_SECRET = os.getenv("EMAIL_SECRET", "")
+IMAP_HOST = os.getenv("IMAP_HOST", "imap.gmail.com")
+IMAP_PORT = int(os.getenv("IMAP_PORT", "993"))
+SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))
+
+email_imap_connection: imaplib.IMAP4_SSL | None = None
+
+
+def close_email_imap() -> None:
+    global email_imap_connection
+
+    if email_imap_connection is None:
+        return
+
+    try:
+        email_imap_connection.logout()
+    except (imaplib.IMAP4.error, OSError):
+        logger.debug("IMAP connection was already closed", exc_info=True)
+    finally:
+        email_imap_connection = None
+
+
+def email_configuration_error() -> str | None:
+    missing = [
+        name
+        for name, value in {
+            "EMAIL_ADDRESS": EMAIL_ADDRESS,
+            "EMAIL_SECRET": EMAIL_SECRET,
+            "IMAP_HOST": IMAP_HOST,
+            "SMTP_HOST": SMTP_HOST,
+        }.items()
+        if not value
+    ]
+    if missing:
+        return f"Missing environment variables: {', '.join(missing)}"
+    return None
+
+
+def open_email_imap() -> imaplib.IMAP4_SSL:
+    global email_imap_connection
+
+    config_error = email_configuration_error()
+    if config_error:
+        raise ValueError(config_error)
+
+    if email_imap_connection is not None:
+        try:
+            status, _ = email_imap_connection.noop()
+            if status == "OK":
+                return email_imap_connection
+        except (imaplib.IMAP4.error, OSError):
+            email_imap_connection = None
+
+    logger.info("Connecting to IMAP server %s:%s", IMAP_HOST, IMAP_PORT)
+    connection = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT, timeout=30)
+    connection.login(EMAIL_ADDRESS, EMAIL_SECRET)
+    email_imap_connection = connection
+    return connection
+
+
+def email_friendly_error(exc: Exception) -> str:
+    message = str(exc).strip() or exc.__class__.__name__
+    lowered = message.lower()
+    if isinstance(exc, imaplib.IMAP4.error) and any(
+        text in lowered for text in ("auth", "credential", "login")
+    ):
+        return "Authentication failed. Check EMAIL_ADDRESS and EMAIL_SECRET."
+    if isinstance(exc, (ConnectionError, TimeoutError, OSError)):
+        return f"Connection failed: {message}"
+    return message
+
+
+def select_email_folder(
+    connection: imaplib.IMAP4_SSL,
+    folder: str = "INBOX",
+) -> None:
+    status, _ = connection.select(folder)
+    if status != "OK":
+        raise ValueError(f"Folder not found or cannot be opened: {folder}")
+
+
+def decode_email_header(value: str | None) -> str:
+    if not value:
+        return ""
+    try:
+        return str(make_header(decode_header(value)))
+    except (LookupError, UnicodeError):
+        return value
+
+
+def decode_email_part(part: Message) -> str:
+    payload = part.get_payload(decode=True)
+    if payload is None:
+        raw_payload = part.get_payload()
+        return raw_payload if isinstance(raw_payload, str) else ""
+
+    charset = part.get_content_charset() or "utf-8"
+    try:
+        return payload.decode(charset, errors="replace")
+    except LookupError:
+        return payload.decode("utf-8", errors="replace")
+
+
+def parse_email_message(message: Message) -> Dict[str, Any]:
+    plain_parts: List[str] = []
+    html_parts: List[str] = []
+    attachments: List[str] = []
+
+    for part in message.walk():
+        if part.is_multipart():
+            continue
+
+        filename = part.get_filename()
+        if filename:
+            attachments.append(decode_email_header(filename))
+            continue
+        if part.get_content_disposition() == "attachment":
+            continue
+
+        if part.get_content_type() == "text/plain":
+            plain_parts.append(decode_email_part(part))
+        elif part.get_content_type() == "text/html":
+            html_parts.append(decode_email_part(part))
+
+    plain_body = "\n".join(part.strip() for part in plain_parts if part.strip())
+    html_body = "\n".join(part.strip() for part in html_parts if part.strip())
+    html_text = ""
+    if html_body:
+        html_text = BeautifulSoup(html_body, "html.parser").get_text("\n", strip=True)
+
+    return {
+        "headers": {
+            "subject": decode_email_header(message.get("Subject")),
+            "from": decode_email_header(message.get("From")),
+            "to": decode_email_header(message.get("To")),
+            "cc": decode_email_header(message.get("Cc")),
+            "date": decode_email_header(message.get("Date")),
+            "message_id": decode_email_header(message.get("Message-ID")),
+        },
+        "plain_body": plain_body,
+        "html_body": html_body,
+        "html_text": html_text,
+        "attachments": attachments,
+    }
+
+
+def fetch_email_message(message_id: str) -> Message:
+    if not str(message_id).strip():
+        raise ValueError("message_id is required")
+
+    connection = open_email_imap()
+    select_email_folder(connection)
+    status, data = connection.fetch(str(message_id), "(BODY.PEEK[])")
+    if status != "OK" or not data or not isinstance(data[0], tuple):
+        raise LookupError(f"Message not found: {message_id}")
+
+    raw_message = data[0][1]
+    if not isinstance(raw_message, bytes):
+        raise LookupError(f"Message not found: {message_id}")
+    return email.message_from_bytes(raw_message)
+
+
+def format_email_search_date(value: str) -> str:
+    value = value.strip()
+    if not value:
+        raise ValueError("Date cannot be empty")
+    for date_format in ("%Y-%m-%d", "%d-%b-%Y"):
+        try:
+            return datetime.strptime(value, date_format).strftime("%d-%b-%Y")
+        except ValueError:
+            continue
+    raise ValueError("Dates must use YYYY-MM-DD or DD-Mon-YYYY format")
+
+
+def quote_email_search_value(value: str) -> str:
+    cleaned = value.replace("\\", "\\\\").replace('"', '\\"').strip()
+    if not cleaned:
+        raise ValueError("Search values cannot be empty")
+    return f'"{cleaned}"'
+
+
+def set_email_seen_flag(message_id: str, seen: bool) -> Dict[str, Any]:
+    try:
+        connection = open_email_imap()
+        select_email_folder(connection)
+        operation = "+FLAGS" if seen else "-FLAGS"
+        status, _ = connection.store(str(message_id), operation, "\\Seen")
+        if status != "OK":
+            raise LookupError(f"Message not found: {message_id}")
+        return {"success": True, "message_id": str(message_id), "read": seen}
+    except Exception as exc:
+        logger.warning("Could not update email flag: %s", exc)
+        return {"success": False, "error": email_friendly_error(exc)}
+
+
+def email_header_metadata(
+    connection: imaplib.IMAP4_SSL,
+    message_id: str,
+) -> Dict[str, str] | None:
+    status, data = connection.fetch(
+        message_id,
+        "(BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE)])",
+    )
+    if status != "OK" or not data or not isinstance(data[0], tuple):
+        return None
+    message = email.message_from_bytes(data[0][1])
+    return {
+        "id": message_id,
+        "subject": decode_email_header(message.get("Subject")),
+        "sender": decode_email_header(message.get("From")),
+        "date": decode_email_header(message.get("Date")),
+    }
+
+
+@mcp.tool()
+def connect() -> Dict[str, Any]:
+    """Establish and retain an authenticated IMAP connection."""
+    try:
+        open_email_imap()
+        return {
+            "success": True,
+            "provider": EMAIL_PROVIDER,
+            "message": "IMAP connection established.",
+        }
+    except Exception as exc:
+        logger.error("IMAP connection failed: %s", exc)
+        return {"success": False, "error": email_friendly_error(exc)}
+
+
+@mcp.tool()
+def health() -> Dict[str, Any]:
+    """Check email configuration, IMAP connectivity, and authentication."""
+    try:
+        connection = open_email_imap()
+        status, _ = connection.noop()
+        if status != "OK":
+            raise ConnectionError("IMAP server did not respond successfully")
+        return {
+            "healthy": True,
+            "provider": EMAIL_PROVIDER,
+            "imap_host": IMAP_HOST,
+        }
+    except Exception as exc:
+        logger.warning("Email health check failed: %s", exc)
+        return {"healthy": False, "error": email_friendly_error(exc)}
+
+
+@mcp.tool()
+def list_folders() -> Dict[str, Any]:
+    """List folders available in the configured email account."""
+    try:
+        status, folders = open_email_imap().list()
+        if status != "OK":
+            raise ConnectionError("Could not list folders")
+        values = [
+            folder.decode("utf-8", errors="replace")
+            for folder in folders or []
+            if isinstance(folder, bytes)
+        ]
+        return {"success": True, "folders": values}
+    except Exception as exc:
+        logger.warning("Could not list email folders: %s", exc)
+        return {"success": False, "error": email_friendly_error(exc)}
+
+
+@mcp.tool()
+def latest_emails(limit: int = 5) -> Dict[str, Any]:
+    """Return metadata for the latest messages in the inbox."""
+    try:
+        if not 1 <= limit <= 100:
+            raise ValueError("limit must be between 1 and 100")
+        connection = open_email_imap()
+        select_email_folder(connection)
+        status, data = connection.search(None, "ALL")
+        if status != "OK":
+            raise ConnectionError("Could not search the inbox")
+
+        ids = data[0].split()[-limit:] if data and data[0] else []
+        messages = []
+        for raw_id in reversed(ids):
+            metadata = email_header_metadata(connection, raw_id.decode())
+            if metadata:
+                messages.append(metadata)
+        return {"success": True, "count": len(messages), "emails": messages}
+    except Exception as exc:
+        logger.warning("Could not fetch latest emails: %s", exc)
+        return {"success": False, "error": email_friendly_error(exc)}
+
+
+@mcp.tool()
+def read_email(message_id: str) -> Dict[str, Any]:
+    """Read one email without changing its read/unread state."""
+    try:
+        parsed = parse_email_message(fetch_email_message(message_id))
+        return {"success": True, "id": str(message_id), **parsed}
+    except Exception as exc:
+        logger.warning("Could not read email %s: %s", message_id, exc)
+        return {"success": False, "error": email_friendly_error(exc)}
+
+
+@mcp.tool()
+def search_emails(
+    unread: bool = False,
+    subject: str | None = None,
+    sender: str | None = None,
+    since: str | None = None,
+    before: str | None = None,
+    limit: int = 50,
+) -> Dict[str, Any]:
+    """Search inbox email by unread status, subject, sender, and date range."""
+    try:
+        if not 1 <= limit <= 200:
+            raise ValueError("limit must be between 1 and 200")
+        criteria = []
+        if unread:
+            criteria.append("UNSEEN")
+        if subject:
+            criteria.extend(["SUBJECT", quote_email_search_value(subject)])
+        if sender:
+            criteria.extend(["FROM", quote_email_search_value(sender)])
+        if since:
+            criteria.extend(["SINCE", format_email_search_date(since)])
+        if before:
+            criteria.extend(["BEFORE", format_email_search_date(before)])
+        if not criteria:
+            criteria.append("ALL")
+
+        connection = open_email_imap()
+        select_email_folder(connection)
+        status, data = connection.search(None, *criteria)
+        if status != "OK":
+            raise ValueError("The IMAP server rejected the search query")
+
+        ids = data[0].split()[-limit:] if data and data[0] else []
+        results = []
+        for raw_id in reversed(ids):
+            metadata = email_header_metadata(connection, raw_id.decode())
+            if metadata:
+                results.append(metadata)
+        return {
+            "success": True,
+            "count": len(results),
+            "criteria": criteria,
+            "emails": results,
+        }
+    except Exception as exc:
+        logger.warning("Email search failed: %s", exc)
+        return {"success": False, "error": email_friendly_error(exc)}
+
+
+@mcp.tool()
+def send_email(
+    to: str,
+    subject: str,
+    body: str,
+    cc: str | None = None,
+    bcc: str | None = None,
+    html: bool = False,
+) -> Dict[str, Any]:
+    """Send a plain-text or HTML email through the configured SMTP server."""
+    try:
+        config_error = email_configuration_error()
+        if config_error:
+            raise ValueError(config_error)
+        if not to.strip():
+            raise ValueError("to is required")
+        if not subject.strip():
+            raise ValueError("subject is required")
+        if not body:
+            raise ValueError("body is required")
+
+        message = EmailMessage()
+        message["From"] = EMAIL_ADDRESS
+        message["To"] = to
+        message["Subject"] = subject
+        if cc:
+            message["Cc"] = cc
+        if bcc:
+            message["Bcc"] = bcc
+        if html:
+            fallback = BeautifulSoup(body, "html.parser").get_text("\n", strip=True)
+            message.set_content(fallback)
+            message.add_alternative(body, subtype="html")
+        else:
+            message.set_content(body)
+
+        with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=30) as smtp:
+            smtp.login(EMAIL_ADDRESS, EMAIL_SECRET)
+            smtp.send_message(message)
+        return {"success": True, "message": "Email sent successfully."}
+    except smtplib.SMTPAuthenticationError:
+        return {
+            "success": False,
+            "error": "Authentication failed. Check EMAIL_ADDRESS and EMAIL_SECRET.",
+        }
+    except Exception as exc:
+        logger.error("Could not send email: %s", exc)
+        return {"success": False, "error": email_friendly_error(exc)}
+
+
+@mcp.tool()
+def mark_read(message_id: str) -> Dict[str, Any]:
+    """Mark an inbox message as read."""
+    return set_email_seen_flag(message_id, True)
+
+
+@mcp.tool()
+def mark_unread(message_id: str) -> Dict[str, Any]:
+    """Mark an inbox message as unread."""
+    return set_email_seen_flag(message_id, False)
+
+
+@mcp.tool()
+def delete_email(message_id: str) -> Dict[str, Any]:
+    """Permanently delete an inbox message using the IMAP Deleted flag."""
+    try:
+        connection = open_email_imap()
+        select_email_folder(connection)
+        status, _ = connection.store(str(message_id), "+FLAGS", "\\Deleted")
+        if status != "OK":
+            raise LookupError(f"Message not found: {message_id}")
+        connection.expunge()
+        return {
+            "success": True,
+            "message_id": str(message_id),
+            "message": "Email deleted permanently.",
+        }
+    except Exception as exc:
+        logger.warning("Could not delete email %s: %s", message_id, exc)
+        return {"success": False, "error": email_friendly_error(exc)}
+
+
+@mcp.tool()
+def list_attachments(message_id: str) -> Dict[str, Any]:
+    """List attachment filenames for an email without downloading them."""
+    try:
+        parsed = parse_email_message(fetch_email_message(message_id))
+        filenames = parsed["attachments"]
+        return {
+            "success": True,
+            "message_id": str(message_id),
+            "count": len(filenames),
+            "attachments": filenames,
+        }
+    except Exception as exc:
+        logger.warning("Could not list email attachments for %s: %s", message_id, exc)
+        return {"success": False, "error": email_friendly_error(exc)}
+
+
+@mcp.tool()
+def summarize_email(message_id: str) -> Dict[str, Any]:
+    """Return the cleaned body of an email without using an LLM."""
+    try:
+        parsed = parse_email_message(fetch_email_message(message_id))
+        body = parsed["plain_body"] or parsed["html_text"]
+        return {
+            "success": True,
+            "message_id": str(message_id),
+            "summary": body.strip(),
+        }
+    except Exception as exc:
+        logger.warning("Could not summarize email %s: %s", message_id, exc)
+        return {"success": False, "error": email_friendly_error(exc)}
+
+
+def main() -> None:
+    try:
+        mcp.run()
+    except KeyboardInterrupt:
+        logger.info("MCP server stopped")
+    finally:
+        close_email_imap()
+
+
 # Allow direct execution of the server
 if __name__ == "__main__":
-    print("Running MCP server...")
-    mcp.run()
+    main()
