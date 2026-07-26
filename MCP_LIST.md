@@ -20,7 +20,9 @@ notebook reading (`read_pdf`, `read_excel`, `read_notebook`), Wikipedia (`summar
 `list_events`, `get_event`, `create_event`, `update_event`, `delete_event`, `list_calendar_acl`,
   `share_calendar`, `watch_calendar_events`, `list_event_changes`), and Google Drive
   (`connect_drive`, `drive_health`, `search_drive_files`, `get_drive_file`,
-  `read_drive_file`, `download_drive_file`).
+  `read_drive_file`, `download_drive_file`), and Open-Meteo weather
+  (`search_weather_locations`, `get_current_weather`, `get_hourly_forecast`,
+  `get_daily_forecast`).
 
 ## High priority — personal assistant essentials
 
@@ -44,7 +46,7 @@ notebook reading (`read_pdf`, `read_excel`, `read_notebook`), Wikipedia (`summar
 - [ ] **Local filesystem search** — full-text or filename search across a configured directory
   tree, complementing Kumo's own `read_file`/`list_directory` (which only lists/reads a path you
   already know) with "find the file that mentions X."
-- [ ] **Weather** — current conditions and short forecast by city/coordinates. Small, self-
+- [x] **Weather** — current conditions and short forecast by city/coordinates. Small, self-
   contained, commonly requested by a personal-assistant bot.
 - [ ] **Currency/unit conversion** — a lot of "how much is X in Y" questions currently have no
   clean tool; `get_price`/`get_price_history` only cover crypto.

@@ -2669,6 +2669,243 @@ async def compare_coins(
 
 
 #
+# Open-Meteo weather functionality
+#
+
+OPEN_METEO_GEOCODING_URL = "https://geocoding-api.open-meteo.com/v1/search"
+OPEN_METEO_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+OPEN_METEO_TIMEOUT = 15.0
+
+OPEN_METEO_CURRENT_VARIABLES = [
+    "temperature_2m",
+    "relative_humidity_2m",
+    "apparent_temperature",
+    "is_day",
+    "precipitation",
+    "rain",
+    "weather_code",
+    "cloud_cover",
+    "surface_pressure",
+    "wind_speed_10m",
+    "wind_direction_10m",
+]
+OPEN_METEO_HOURLY_VARIABLES = [
+    "temperature_2m",
+    "relative_humidity_2m",
+    "apparent_temperature",
+    "precipitation_probability",
+    "precipitation",
+    "rain",
+    "weather_code",
+    "cloud_cover",
+    "wind_speed_10m",
+    "wind_direction_10m",
+]
+OPEN_METEO_DAILY_VARIABLES = [
+    "weather_code",
+    "temperature_2m_max",
+    "temperature_2m_min",
+    "apparent_temperature_max",
+    "apparent_temperature_min",
+    "sunrise",
+    "sunset",
+    "precipitation_sum",
+    "precipitation_probability_max",
+    "wind_speed_10m_max",
+    "wind_gusts_10m_max",
+]
+OPEN_METEO_WMO_DESCRIPTIONS = {
+    0: "Clear sky",
+    1: "Mainly clear",
+    2: "Partly cloudy",
+    3: "Overcast",
+    45: "Fog",
+    48: "Depositing rime fog",
+    51: "Light drizzle",
+    53: "Moderate drizzle",
+    55: "Dense drizzle",
+    56: "Light freezing drizzle",
+    57: "Dense freezing drizzle",
+    61: "Slight rain",
+    63: "Moderate rain",
+    65: "Heavy rain",
+    66: "Light freezing rain",
+    67: "Heavy freezing rain",
+    71: "Slight snowfall",
+    73: "Moderate snowfall",
+    75: "Heavy snowfall",
+    77: "Snow grains",
+    80: "Slight rain showers",
+    81: "Moderate rain showers",
+    82: "Violent rain showers",
+    85: "Slight snow showers",
+    86: "Heavy snow showers",
+    95: "Thunderstorm",
+    96: "Thunderstorm with slight hail",
+    99: "Thunderstorm with heavy hail",
+}
+
+
+def open_meteo_request(url: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        response = httpx.get(url, params=params, timeout=OPEN_METEO_TIMEOUT)
+        response.raise_for_status()
+        return response.json()
+    except httpx.HTTPStatusError as exc:
+        try:
+            reason = exc.response.json().get("reason", exc.response.text)
+        except ValueError:
+            reason = exc.response.text
+        raise ValueError(f"Open-Meteo API error: {reason}") from exc
+    except httpx.RequestError as exc:
+        raise ConnectionError(f"Could not reach Open-Meteo: {exc}") from exc
+
+
+def validate_weather_coordinates(latitude: float, longitude: float) -> None:
+    if not -90 <= latitude <= 90:
+        raise ValueError("latitude must be between -90 and 90")
+    if not -180 <= longitude <= 180:
+        raise ValueError("longitude must be between -180 and 180")
+
+
+def describe_weather(item: Dict[str, Any]) -> Dict[str, Any]:
+    code = item.get("weather_code")
+    if code is not None:
+        item["weather_description"] = OPEN_METEO_WMO_DESCRIPTIONS.get(code, "Unknown")
+    return item
+
+
+def weather_rows(data: Dict[str, List[Any]]) -> List[Dict[str, Any]]:
+    keys = list(data)
+    if not keys:
+        return []
+    return [
+        describe_weather(dict(zip(keys, values)))
+        for values in zip(*(data[key] for key in keys))
+    ]
+
+
+@mcp.tool()
+def search_weather_locations(
+    name: str,
+    count: int = 5,
+    language: str = "en",
+) -> Dict[str, Any]:
+    """Find cities or places and return coordinates suitable for weather tools."""
+    if not name.strip():
+        raise ValueError("name is required")
+    if not 1 <= count <= 100:
+        raise ValueError("count must be between 1 and 100")
+    data = open_meteo_request(
+        OPEN_METEO_GEOCODING_URL,
+        {"name": name, "count": count, "language": language, "format": "json"},
+    )
+    locations = [
+        {
+            "id": item.get("id"),
+            "name": item.get("name", ""),
+            "latitude": item.get("latitude"),
+            "longitude": item.get("longitude"),
+            "elevation": item.get("elevation"),
+            "timezone": item.get("timezone", ""),
+            "country": item.get("country", ""),
+            "country_code": item.get("country_code", ""),
+            "admin1": item.get("admin1", ""),
+            "admin2": item.get("admin2", ""),
+        }
+        for item in data.get("results", [])
+    ]
+    return {"count": len(locations), "locations": locations}
+
+
+@mcp.tool()
+def get_current_weather(
+    latitude: float,
+    longitude: float,
+    timezone: str = "auto",
+) -> Dict[str, Any]:
+    """Get current weather conditions for geographic coordinates."""
+    validate_weather_coordinates(latitude, longitude)
+    data = open_meteo_request(
+        OPEN_METEO_FORECAST_URL,
+        {
+            "latitude": latitude,
+            "longitude": longitude,
+            "current": ",".join(OPEN_METEO_CURRENT_VARIABLES),
+            "timezone": timezone,
+        },
+    )
+    return {
+        "latitude": data.get("latitude"),
+        "longitude": data.get("longitude"),
+        "elevation": data.get("elevation"),
+        "timezone": data.get("timezone"),
+        "units": data.get("current_units", {}),
+        "current": describe_weather(data.get("current", {})),
+    }
+
+
+@mcp.tool()
+def get_hourly_forecast(
+    latitude: float,
+    longitude: float,
+    forecast_days: int = 2,
+    timezone: str = "auto",
+) -> Dict[str, Any]:
+    """Get an hourly weather forecast for up to 16 days."""
+    validate_weather_coordinates(latitude, longitude)
+    if not 1 <= forecast_days <= 16:
+        raise ValueError("forecast_days must be between 1 and 16")
+    data = open_meteo_request(
+        OPEN_METEO_FORECAST_URL,
+        {
+            "latitude": latitude,
+            "longitude": longitude,
+            "hourly": ",".join(OPEN_METEO_HOURLY_VARIABLES),
+            "forecast_days": forecast_days,
+            "timezone": timezone,
+        },
+    )
+    return {
+        "latitude": data.get("latitude"),
+        "longitude": data.get("longitude"),
+        "timezone": data.get("timezone"),
+        "units": data.get("hourly_units", {}),
+        "forecast": weather_rows(data.get("hourly", {})),
+    }
+
+
+@mcp.tool()
+def get_daily_forecast(
+    latitude: float,
+    longitude: float,
+    forecast_days: int = 7,
+    timezone: str = "auto",
+) -> Dict[str, Any]:
+    """Get a daily weather forecast for up to 16 days."""
+    validate_weather_coordinates(latitude, longitude)
+    if not 1 <= forecast_days <= 16:
+        raise ValueError("forecast_days must be between 1 and 16")
+    data = open_meteo_request(
+        OPEN_METEO_FORECAST_URL,
+        {
+            "latitude": latitude,
+            "longitude": longitude,
+            "daily": ",".join(OPEN_METEO_DAILY_VARIABLES),
+            "forecast_days": forecast_days,
+            "timezone": timezone,
+        },
+    )
+    return {
+        "latitude": data.get("latitude"),
+        "longitude": data.get("longitude"),
+        "timezone": data.get("timezone"),
+        "units": data.get("daily_units", {}),
+        "forecast": weather_rows(data.get("daily", {})),
+    }
+
+
+#
 # Google Calendar and Drive functionality
 #
 
