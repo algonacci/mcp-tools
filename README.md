@@ -34,6 +34,8 @@ returns it as MCP image content. arXiv papers are stored under `downloads/arxiv`
 `create_data_chart` provides the same high-DPI output for selected columns in
 CSV or Excel files, with labels, annotations, summary statistics, and source notes.
 Use `inspect_data_file` first to discover sheets, columns, data types, and sample rows.
+For dummy, generated, or small datasets, `create_inline_data_chart` accepts records
+directly and returns the PNG without creating a script or temporary data file.
 
 ## PlantUML
 

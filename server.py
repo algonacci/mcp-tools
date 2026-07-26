@@ -2911,17 +2911,27 @@ def render_data_chart(
     frame = frame.dropna(subset=y_columns, how="all")
     if frame.empty:
         raise ValueError("Selected y columns contain no numeric values")
+    frame = frame.reset_index(drop=True)
 
     x_values = frame[x_column]
+    positions = list(range(len(frame)))
+    categorical_x = False
     if not pd.api.types.is_numeric_dtype(x_values):
-        parsed_dates = pd.to_datetime(x_values, errors="coerce")
-        if parsed_dates.notna().all():
-            x_values = parsed_dates
+        text_values = x_values.astype(str)
+        looks_like_date = text_values.str.match(
+            r"^\d{4}[-/]\d{1,2}(?:[-/]\d{1,2})?(?:[ T].*)?$"
+        ).all()
+        if looks_like_date:
+            parsed_dates = pd.to_datetime(x_values, errors="coerce")
+            if parsed_dates.notna().all():
+                x_values = parsed_dates
+        else:
+            categorical_x = True
+            x_values = positions
 
     fig, ax = plt.subplots(figsize=(11, 6.2))
     colors = ["#2563eb", "#dc2626", "#059669", "#d97706", "#7c3aed"]
     width = 0.8 / len(y_columns)
-    positions = list(range(len(frame)))
 
     for index, column in enumerate(y_columns):
         values = frame[column]
@@ -2939,7 +2949,7 @@ def render_data_chart(
         if annotate and chart_type != "bar" and len(frame) <= 30:
             valid = values.dropna()
             for row_index in {valid.index[0], valid.index[-1]} if not valid.empty else set():
-                x_value = x_values.loc[row_index]
+                x_value = x_values.iloc[row_index] if hasattr(x_values, "iloc") else x_values[row_index]
                 y_value = values.loc[row_index]
                 ax.annotate(
                     f"{y_value:,.4g}",
@@ -2950,7 +2960,7 @@ def render_data_chart(
                     color=color,
                 )
 
-    if chart_type == "bar":
+    if chart_type == "bar" or categorical_x:
         ax.set_xticks(positions, [str(value) for value in frame[x_column]], rotation=30, ha="right")
     ax.set_title(title, fontsize=16, fontweight="bold", loc="left", pad=18)
     ax.set_xlabel(x_label or x_column)
@@ -3043,6 +3053,56 @@ def inspect_data_file(
 
 
 @mcp.tool()
+def create_inline_data_chart(
+    data: List[Dict[str, Any]],
+    x_column: str,
+    y_columns: List[str],
+    chart_type: str = "line",
+    title: str | None = None,
+    x_label: str | None = None,
+    y_label: str | None = None,
+    source_note: str = "Source: generated data",
+    filename: str = "inline-data-chart.png",
+    dpi: int = 200,
+    annotate: bool = True,
+) -> List[Any]:
+    """Create an informative high-DPI PNG chart from inline records.
+
+    Use this directly for dummy, generated, or small user-provided datasets instead of writing a
+    script or temporary CSV. Prefer explicit titles and labels, annotations, and a source note.
+    """
+    if not data:
+        raise ValueError("data cannot be empty")
+    if len(data) > 1000:
+        raise ValueError("data cannot contain more than 1000 records")
+    frame = pd.DataFrame(data)
+    chart_path, details = render_data_chart(
+        frame,
+        x_column,
+        y_columns,
+        chart_type,
+        title or f"{', '.join(y_columns)} by {x_column}",
+        x_label,
+        y_label,
+        source_note,
+        filename,
+        dpi,
+        annotate,
+    )
+    metadata = {
+        "success": True,
+        "file_path": str(chart_path),
+        "mime_type": "image/png",
+        "chart_type": chart_type,
+        "x_column": x_column,
+        "y_columns": y_columns,
+        "dpi": dpi,
+        **details,
+    }
+    return [metadata, Image(path=chart_path)]
+
+
+@mcp.tool()
 def create_data_chart(
     file_path: str,
     x_column: str,
@@ -3060,7 +3120,8 @@ def create_data_chart(
     """Create an informative high-DPI PNG chart from selected CSV or Excel columns.
 
     Choose columns that answer the user's question. Prefer an explicit title and axis labels,
-    retain annotations unless the chart is dense, and include a short source_note when known.
+    retain annotations unless the chart is dense, and include a short source_note when known. For
+    dummy or generated data that is not already in a file, use create_inline_data_chart instead.
     """
     path, data = load_tabular_file(file_path, sheet_name)
 
