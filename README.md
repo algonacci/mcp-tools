@@ -37,6 +37,16 @@ Use `inspect_data_file` first to discover sheets, columns, data types, and sampl
 For dummy, generated, or small datasets, `create_inline_data_chart` accepts records
 directly and returns the PNG without creating a script or temporary data file.
 
+## GARUDA academic search
+
+`search_garuda` mirrors the filters on GARUDA's own search form
+(`https://garuda.kemdiktisaintek.go.id/documents`): pass `search_field`
+(`title`, `abstract`, `author`, or `doi`) to restrict which field the query
+matches against — use `author` for exact author-name lookups, since plain
+keyword search does not reliably match on author names. Additional filters:
+`publisher` (name, min. 3 characters), `pdf_only` (downloadable PDF only),
+and `year_from`/`year_to` (publication year range).
+
 ## PlantUML
 
 `render_plantuml` renders source containing `@startuml` and `@enduml` as PNG
