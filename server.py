@@ -22,7 +22,10 @@ import asyncio
 from io import BytesIO
 import json
 from datetime import date, datetime, timezone
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse, parse_qs
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import threading
+import webbrowser
 from playwright.async_api import async_playwright, Page
 from playwright_stealth import Stealth
 from bs4 import BeautifulSoup
@@ -3661,11 +3664,14 @@ def get_google_credentials():
             raise FileNotFoundError(
                 f"Google OAuth credentials not found: {GOOGLE_CREDENTIALS}"
             )
-        flow = InstalledAppFlow.from_client_secrets_file(
-            GOOGLE_CREDENTIALS,
-            GOOGLE_SCOPES,
+        # Deliberately not run_local_server(): it opens a browser on whatever machine the server
+        # runs on and blocks the tool call until someone clicks. On a headless host that fails with
+        # "could not locate runnable browser"; even with a browser it stalls an MCP call for
+        # minutes. Authorization is an explicit, two-step user action instead.
+        raise PermissionError(
+            "Google is not authorized yet. Call google_auth_start to get an authorization URL, "
+            "then google_auth_complete with the URL you land on."
         )
-        credentials = flow.run_local_server(port=0, access_type="offline", prompt="consent")
 
     with open(GOOGLE_TOKEN, "w", encoding="utf-8") as token_file:
         token_file.write(credentials.to_json())
@@ -3687,6 +3693,173 @@ def get_google_drive_service():
     if google_drive_service is None:
         google_drive_service = build("drive", "v3", credentials=get_google_credentials())
     return google_drive_service
+
+
+GOOGLE_OAUTH_PORT = int(os.getenv("GOOGLE_OAUTH_PORT", "8765"))
+# How long the loopback listener waits for the browser to come back before giving up and leaving
+# the paste-back path as the only way to finish.
+GOOGLE_OAUTH_LISTEN_SECONDS = 300
+
+google_oauth_flow = None
+google_oauth_result: Dict[str, Any] = {}
+
+
+def google_oauth_redirect_uri() -> str:
+    return f"http://localhost:{GOOGLE_OAUTH_PORT}/"
+
+
+def start_google_oauth_listener() -> bool:
+    """Serve the loopback redirect so a desktop browser can finish the flow by itself.
+
+    This is best effort. On a headless host the user's browser is on another machine and can never
+    reach this port, which is exactly why `google_auth_complete` exists — the two paths race, and
+    whichever completes first wins. Returns whether the listener is actually accepting connections.
+    """
+
+    class CallbackHandler(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802 - name fixed by BaseHTTPRequestHandler
+            params = parse_qs(urlparse(self.path).query)
+            code = params.get("code", [""])[0]
+            error = params.get("error", [""])[0]
+            if code:
+                try:
+                    finish_google_oauth(code)
+                    body = "Google account connected. You can close this tab."
+                except Exception as exc:  # pragma: no cover - depends on Google's response
+                    body = f"Could not complete authorization: {exc}"
+            else:
+                body = f"Authorization failed: {error or 'no code returned'}"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(body.encode())
+
+        def log_message(self, *args):
+            """Keep the HTTP access log out of the MCP server's stderr."""
+
+    try:
+        server = HTTPServer(("127.0.0.1", GOOGLE_OAUTH_PORT), CallbackHandler)
+    except OSError as exc:
+        logger.info("Google OAuth listener could not bind port %s: %s", GOOGLE_OAUTH_PORT, exc)
+        return False
+
+    server.timeout = GOOGLE_OAUTH_LISTEN_SECONDS
+
+    def serve_once():
+        try:
+            server.handle_request()
+        finally:
+            server.server_close()
+
+    threading.Thread(target=serve_once, daemon=True).start()
+    return True
+
+
+def finish_google_oauth(code: str) -> Dict[str, Any]:
+    """Exchange an authorization code for a token and persist it."""
+    global google_credentials, google_calendar_service, google_drive_service, google_oauth_flow
+
+    if google_oauth_flow is None:
+        raise ValueError("No authorization is in progress; call google_auth_start first")
+
+    google_oauth_flow.fetch_token(code=code)
+    credentials = google_oauth_flow.credentials
+    with open(GOOGLE_TOKEN, "w", encoding="utf-8") as token_file:
+        token_file.write(credentials.to_json())
+
+    google_credentials = credentials
+    # Drop cached clients so the next call builds them with the new token.
+    google_calendar_service = None
+    google_drive_service = None
+    google_oauth_flow = None
+    google_oauth_result.clear()
+    google_oauth_result["connected"] = True
+    return {"success": True, "message": "Google account connected."}
+
+
+@mcp.tool()
+def google_auth_start() -> Dict[str, Any]:
+    """Begin Google (Calendar and Drive) authorization and return the URL to approve it.
+
+    Works with or without a browser on this machine. If a browser is available it is opened and the
+    flow finishes by itself; otherwise open the returned URL anywhere — a phone is fine — approve
+    access, and send the address bar's URL to google_auth_complete. That page will fail to load,
+    which is expected: the authorization code is in its query string.
+    """
+    global google_oauth_flow
+    try:
+        try:
+            if get_google_credentials():
+                return {
+                    "success": True,
+                    "already_connected": True,
+                    "message": "Google is already authorized; nothing to do.",
+                }
+        except Exception:
+            pass  # Not authorized yet, which is the whole point of this tool.
+
+        if not os.path.exists(GOOGLE_CREDENTIALS):
+            raise FileNotFoundError(
+                f"Google OAuth credentials not found: {GOOGLE_CREDENTIALS}. Create an OAuth "
+                "client of type 'Desktop app' in Google Cloud Console, enable the Calendar and "
+                "Drive APIs, and save the downloaded file to that path."
+            )
+
+        flow = InstalledAppFlow.from_client_secrets_file(GOOGLE_CREDENTIALS, GOOGLE_SCOPES)
+        flow.redirect_uri = google_oauth_redirect_uri()
+        auth_url, _ = flow.authorization_url(access_type="offline", prompt="consent")
+        google_oauth_flow = flow
+
+        listening = start_google_oauth_listener()
+        try:
+            opened = webbrowser.open(auth_url)
+        except Exception:
+            opened = False
+
+        return {
+            "success": True,
+            "auth_url": auth_url,
+            "browser_opened": opened,
+            "waiting_for_callback": listening,
+            "message": (
+                "A browser was opened; approve access there and this finishes by itself."
+                if opened and listening
+                else "Open this URL, approve access, then send the URL you land on (it will show "
+                "a connection error) to google_auth_complete."
+            ),
+        }
+    except Exception as exc:
+        logger.warning("Could not start Google authorization: %s", exc)
+        return {"success": False, "error": str(exc)}
+
+
+@mcp.tool()
+def google_auth_complete(redirect_url: str = "", code: str = "") -> Dict[str, Any]:
+    """Finish Google authorization with the URL the browser landed on, or a bare code.
+
+    Pass the whole address-bar URL from the page that failed to load after approving access
+    (`http://localhost:.../?code=...`); a bare `code` value works too.
+    """
+    try:
+        if google_oauth_result.get("connected"):
+            return {"success": True, "message": "Google account already connected."}
+
+        value = (code or "").strip()
+        if not value and redirect_url.strip():
+            query = parse_qs(urlparse(redirect_url.strip()).query)
+            value = query.get("code", [""])[0]
+            if not value:
+                error = query.get("error", [""])[0]
+                raise ValueError(
+                    f"No authorization code in that URL{': ' + error if error else ''}"
+                )
+        if not value:
+            raise ValueError("Provide the redirect_url you landed on, or the code from it")
+
+        return finish_google_oauth(value)
+    except Exception as exc:
+        logger.warning("Could not complete Google authorization: %s", exc)
+        return {"success": False, "error": str(exc)}
 
 
 def google_calendar_event(event: Dict[str, Any]) -> Dict[str, Any]:

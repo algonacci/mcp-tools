@@ -61,10 +61,30 @@ required variables. Never commit `.env`.
 
 ## Google Calendar and Drive configuration
 
-Place the Google Desktop OAuth client file at `credentials.json`. The first
-Calendar or Drive tool call opens browser authorization and creates
-`token.json`. Enable both the Google Calendar API and Google Drive API in the
-Google Cloud project. Both files are ignored by Git.
+Place the Google Desktop OAuth client file at `credentials.json`, with both the
+Google Calendar API and Google Drive API enabled in that Google Cloud project.
+Both `credentials.json` and `token.json` are ignored by Git.
+
+Authorization is a two-step tool call, so it works the same whether the server
+runs on your laptop or on a machine with no browser at all:
+
+1. Call `google_auth_start`. It returns an authorization URL.
+2. Approve access in a browser — any browser, on any device.
+3. Call `google_auth_complete` with the URL you land on.
+
+On a desktop, steps 2 and 3 usually happen by themselves: the browser is opened
+for you and the redirect is caught on `http://localhost:8765` (set
+`GOOGLE_OAUTH_PORT` to change it), so approving in the browser is all you do.
+
+On a headless server, or when you approve on a phone, that redirect cannot be
+reached and the browser shows a connection error. That is expected — the
+authorization code is in the address bar. Copy the whole URL
+(`http://localhost:8765/?code=...`) and pass it to `google_auth_complete`. It
+also accepts the bare `code` value if that is easier to copy.
+
+Whichever path finishes first wins, so it is safe to start in the browser and
+fall back to pasting. Tokens refresh themselves afterwards; you only repeat this
+if the token is revoked or the requested scopes change.
 
 Drive access uses the read-only scope. It can search files, inspect metadata,
 read Docs and Sheets as text, and download or export files. Existing Calendar
