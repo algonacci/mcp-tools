@@ -4380,13 +4380,30 @@ def parse_email_message(message: Message) -> Dict[str, Any]:
     }
 
 
-def fetch_email_message(message_id: str) -> Message:
-    if not str(message_id).strip():
-        raise ValueError("message_id is required")
+def normalize_email_uid(message_id: str | int) -> str:
+    """Validate a message id and return it as a UID string.
 
+    Ids are IMAP UIDs, which are stable for the life of the mailbox — unlike sequence numbers,
+    which shift down whenever an earlier message is expunged, so a list of them collected before a
+    delete would address the wrong messages afterwards.
+
+    Accepts an int as well as a str because ids look numeric and callers (LLM tool calls in
+    particular) routinely send them as JSON numbers. Rejecting anything but digits also keeps the
+    value from being interpolated into an IMAP command as extra arguments.
+    """
+    text = str(message_id).strip()
+    if not text:
+        raise ValueError("message_id is required")
+    if not text.isdigit():
+        raise ValueError(f"message_id must be a numeric IMAP UID, got: {message_id!r}")
+    return text
+
+
+def fetch_email_message(message_id: str | int) -> Message:
     connection = open_email_imap()
     select_email_folder(connection)
-    status, data = connection.fetch(str(message_id), "(BODY.PEEK[])")
+    uid = normalize_email_uid(message_id)
+    status, data = connection.uid("FETCH", uid, "(BODY.PEEK[])")
     if status != "OK" or not data or not isinstance(data[0], tuple):
         raise LookupError(f"Message not found: {message_id}")
 
@@ -4415,12 +4432,13 @@ def quote_email_search_value(value: str) -> str:
     return f'"{cleaned}"'
 
 
-def set_email_seen_flag(message_id: str, seen: bool) -> Dict[str, Any]:
+def set_email_seen_flag(message_id: str | int, seen: bool) -> Dict[str, Any]:
     try:
         connection = open_email_imap()
         select_email_folder(connection)
+        uid = normalize_email_uid(message_id)
         operation = "+FLAGS" if seen else "-FLAGS"
-        status, _ = connection.store(str(message_id), operation, "\\Seen")
+        status, _ = connection.uid("STORE", uid, operation, "\\Seen")
         if status != "OK":
             raise LookupError(f"Message not found: {message_id}")
         return {"success": True, "message_id": str(message_id), "read": seen}
@@ -4433,7 +4451,8 @@ def email_header_metadata(
     connection: imaplib.IMAP4_SSL,
     message_id: str,
 ) -> Dict[str, str] | None:
-    status, data = connection.fetch(
+    status, data = connection.uid(
+        "FETCH",
         message_id,
         "(BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE)])",
     )
@@ -4507,7 +4526,7 @@ def latest_emails(limit: int = 5) -> Dict[str, Any]:
             raise ValueError("limit must be between 1 and 100")
         connection = open_email_imap()
         select_email_folder(connection)
-        status, data = connection.search(None, "ALL")
+        status, data = connection.uid("SEARCH", "ALL")
         if status != "OK":
             raise ConnectionError("Could not search the inbox")
 
@@ -4524,7 +4543,7 @@ def latest_emails(limit: int = 5) -> Dict[str, Any]:
 
 
 @mcp.tool()
-def read_email(message_id: str) -> Dict[str, Any]:
+def read_email(message_id: str | int) -> Dict[str, Any]:
     """Read one email without changing its read/unread state."""
     try:
         parsed = parse_email_message(fetch_email_message(message_id))
@@ -4563,7 +4582,7 @@ def search_emails(
 
         connection = open_email_imap()
         select_email_folder(connection)
-        status, data = connection.search(None, *criteria)
+        status, data = connection.uid("SEARCH", *criteria)
         if status != "OK":
             raise ValueError("The IMAP server rejected the search query")
 
@@ -4635,24 +4654,25 @@ def send_email(
 
 
 @mcp.tool()
-def mark_read(message_id: str) -> Dict[str, Any]:
+def mark_read(message_id: str | int) -> Dict[str, Any]:
     """Mark an inbox message as read."""
     return set_email_seen_flag(message_id, True)
 
 
 @mcp.tool()
-def mark_unread(message_id: str) -> Dict[str, Any]:
+def mark_unread(message_id: str | int) -> Dict[str, Any]:
     """Mark an inbox message as unread."""
     return set_email_seen_flag(message_id, False)
 
 
 @mcp.tool()
-def delete_email(message_id: str) -> Dict[str, Any]:
+def delete_email(message_id: str | int) -> Dict[str, Any]:
     """Permanently delete an inbox message using the IMAP Deleted flag."""
     try:
         connection = open_email_imap()
         select_email_folder(connection)
-        status, _ = connection.store(str(message_id), "+FLAGS", "\\Deleted")
+        uid = normalize_email_uid(message_id)
+        status, _ = connection.uid("STORE", uid, "+FLAGS", "\\Deleted")
         if status != "OK":
             raise LookupError(f"Message not found: {message_id}")
         connection.expunge()
@@ -4667,7 +4687,7 @@ def delete_email(message_id: str) -> Dict[str, Any]:
 
 
 @mcp.tool()
-def list_attachments(message_id: str) -> Dict[str, Any]:
+def list_attachments(message_id: str | int) -> Dict[str, Any]:
     """List attachment filenames for an email without downloading them."""
     try:
         parsed = parse_email_message(fetch_email_message(message_id))
@@ -4684,7 +4704,7 @@ def list_attachments(message_id: str) -> Dict[str, Any]:
 
 
 @mcp.tool()
-def summarize_email(message_id: str) -> Dict[str, Any]:
+def summarize_email(message_id: str | int) -> Dict[str, Any]:
     """Return the cleaned body of an email without using an LLM."""
     try:
         parsed = parse_email_message(fetch_email_message(message_id))
