@@ -2222,7 +2222,31 @@ async def search_ieee(query: str, limit: int = 10, start_year: int = None, end_y
 # ScienceDirect functionality
 #
 
+SCIENCEDIRECT_CHALLENGE_TITLES = ("just a moment", "attention required", "are you a robot", "access denied")
+
+
+def detect_sciencedirect_block(status: int | None, title: str) -> str | None:
+    """Recognise rate limiting or a bot challenge so the batch stops instead of hammering the site."""
+    if status in (403, 429):
+        return f"HTTP {status}"
+    if any(marker in (title or "").lower() for marker in SCIENCEDIRECT_CHALLENGE_TITLES):
+        return f"challenge page ({title})"
+    return None
+
+
 SCIENCEDIRECT_ABSTRACT_JS = r"""() => {
+    const clean = (text) => text.replace(/^(Abstract|Summary)\s*/i, '').trim();
+
+    // An article can carry several .abstract blocks (Highlights, Abstract, Graphical abstract); prefer the author abstract
+    const blocks = [...document.querySelectorAll('#abstracts .abstract.author, .Abstracts .abstract.author')];
+    const authorAbstract = blocks.find(el => {
+        const heading = el.querySelector('h2, h3');
+        return heading && /^(abstract|summary)/i.test(heading.innerText.trim());
+    });
+    if (authorAbstract && clean(authorAbstract.innerText).length > 20) {
+        return clean(authorAbstract.innerText);
+    }
+
     const selectors = [
         '#abstracts',
         '.Abstracts',
@@ -2249,34 +2273,40 @@ async def search_sciencedirect(query: str, limit: int = 3) -> str:
     Args:
         query: The search query (e.g., "text-to-sql")
         limit: Max number of results to process (default: 3)
-    """
-    logger.info(f"Launching Browser (Persistent Context) to search for: {query}...")
 
-    # Create user_data directory if not exists
-    # Anchored to this file rather than the MCP client's working directory, so the browser session persists
-    user_data_dir = os.getenv("SCIENCEDIRECT_USER_DATA_DIR") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "user_data")
-    os.makedirs(user_data_dir, exist_ok=True)
+    Set SCIENCEDIRECT_CDP_URL (e.g. http://127.0.0.1:9222) to reuse a browser you started and logged into
+    yourself instead of launching a new one. Abstract extraction stops at the first HTTP 403/429 or challenge.
+    """
+    cdp_url = os.getenv("SCIENCEDIRECT_CDP_URL")
 
     async with async_playwright() as p:
-        # Using launch_persistent_context for persistence and stealth
-        # Headless configurable via env var, default to False (safer for bot detection)
-        # Users can set HEADLESS=true in .env if they extracted valid cookies/state
-        headless_mode = os.getenv("HEADLESS", "false").lower() == "true"
-        
-        context = await p.chromium.launch_persistent_context(
-            user_data_dir=user_data_dir,
-            headless=headless_mode,
-            args=[
-                '--disable-blink-features=AutomationControlled',
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-            ],
-            ignore_default_args=["--enable-automation"],
-            locale="id-ID",
-            viewport={"width": 1920, "height": 1080}
-        )
-        
-        page = context.pages[0] if context.pages else await context.new_page()
+        if cdp_url:
+            # Attach to a browser the user runs and logs into themselves, e.g. Brave started with
+            # --remote-debugging-port=9222 and a dedicated research profile. That browser stays open afterwards.
+            logger.info(f"Connecting to existing browser at {cdp_url} to search for: {query}...")
+            browser = await p.chromium.connect_over_cdp(cdp_url)
+            context = browser.contexts[0] if browser.contexts else await browser.new_context()
+            page = await context.new_page()
+        else:
+            logger.info(f"Launching Browser (Persistent Context) to search for: {query}...")
+            # Anchored to this file rather than the MCP client's working directory, so the browser session persists
+            user_data_dir = os.getenv("SCIENCEDIRECT_USER_DATA_DIR") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "user_data")
+            os.makedirs(user_data_dir, exist_ok=True)
+            # Headless configurable via env var, default to False (safer for bot detection)
+            headless_mode = os.getenv("HEADLESS", "false").lower() == "true"
+            context = await p.chromium.launch_persistent_context(
+                user_data_dir=user_data_dir,
+                headless=headless_mode,
+                args=[
+                    '--disable-blink-features=AutomationControlled',
+                    '--no-sandbox',
+                    '--disable-setuid-sandbox',
+                ],
+                ignore_default_args=["--enable-automation"],
+                locale="id-ID",
+                viewport={"width": 1920, "height": 1080}
+            )
+            page = context.pages[0] if context.pages else await context.new_page()
 
         # Token capture mechanism
         token_container = {"token": None}
@@ -2320,7 +2350,7 @@ async def search_sciencedirect(query: str, limit: int = 3) -> str:
             token = token_container["token"]
             
             if not token:
-                return json.dumps({"error": "Could not capture ScienceDirect API token. Blocking may be active."})
+                return json.dumps({"error": "Could not capture ScienceDirect API token. Blocking may be active.", "page_title": await page.title()})
             
             logger.info("Token intercepted. Fetching metadata API...")
 
@@ -2353,12 +2383,14 @@ async def search_sciencedirect(query: str, limit: int = 3) -> str:
             logger.info(f"Found {total_found} results. Processing top {process_count}...")
 
             papers = []
+            blocked = None
             for i in range(process_count):
                 record = search_results[i]
                 link = record.get("link", "")
                 if link and not link.startswith("http"):
                     link = "https://www.sciencedirect.com" + link
-                year_match = re.search(r"\b(19|20)\d{2}\b", str(record.get("publicationDate") or ""))
+                publication_date = record.get("publicationDateDisplay") or record.get("sortDate") or record.get("availableOnlineDate")
+                year_match = re.search(r"\b(19|20)\d{2}\b", str(publication_date or ""))
 
                 paper = {
                     "index": i + 1,
@@ -2371,15 +2403,28 @@ async def search_sciencedirect(query: str, limit: int = 3) -> str:
                     "abstract_error": None,
                     "url": link or None,
                     "publication": record.get("sourceTitle") or None,
+                    "volume_issue": record.get("volumeIssue") or None,
+                    "open_access": bool(record.get("openAccess") or record.get("openArchive")),
                 }
+
+                if blocked:
+                    paper["abstract_error"] = f"Skipped: stopped after {blocked}"
+                    papers.append(paper)
+                    continue
 
                 logger.info(f"[{i+1}/{process_count}] Navigating to extract abstract...")
                 try:
-                    await page.goto(link, wait_until="domcontentloaded", timeout=45000)
+                    response = await page.goto(link, wait_until="domcontentloaded", timeout=45000)
                     await asyncio.sleep(2)
-                    paper["abstract"] = await page.evaluate(SCIENCEDIRECT_ABSTRACT_JS)
-                    if not paper["abstract"]:
-                        paper["abstract_error"] = "Abstract section not found in the DOM (access might be restricted)."
+                    blocked = detect_sciencedirect_block(response.status if response else None, await page.title())
+                    if blocked:
+                        # Never retry or work around a block: stop the batch and hand it back to the user
+                        paper["abstract_error"] = f"Blocked: {blocked}"
+                        logger.info(f"Stopping abstract extraction: {blocked}")
+                    else:
+                        paper["abstract"] = await page.evaluate(SCIENCEDIRECT_ABSTRACT_JS)
+                        if not paper["abstract"]:
+                            paper["abstract_error"] = "Abstract section not found in the DOM (access might be restricted)."
                 except Exception as e:
                     paper["abstract_error"] = f"Page load error: {e}"
 
@@ -2391,11 +2436,15 @@ async def search_sciencedirect(query: str, limit: int = 3) -> str:
                 "source": "sciencedirect",
                 "total_found": total_found,
                 "returned_results": len(papers),
+                "blocked": blocked,
                 "results": papers,
             }, indent=2, ensure_ascii=False)
 
         finally:
-            await context.close()
+            if cdp_url:
+                await page.close()  # leave the user's browser and session running
+            else:
+                await context.close()
 
 @mcp.tool()
 def read_notebook(
