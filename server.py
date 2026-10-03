@@ -22,7 +22,7 @@ import asyncio
 from io import BytesIO
 import json
 from datetime import date, datetime, timezone
-from urllib.parse import urljoin, urlparse, parse_qs
+from urllib.parse import urljoin, urlparse, parse_qs, quote_plus
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import threading
 import webbrowser
@@ -35,6 +35,7 @@ import logging
 import signal
 import smtplib
 import sys
+import html
 import zlib
 from email.header import decode_header, make_header
 from email.message import EmailMessage, Message
@@ -1507,10 +1508,10 @@ def read_excel(file_path: str, sheet_name: str = None) -> pd.DataFrame:
     try:
         # If sheet_name is None, pandas will read the first sheet by default
         if sheet_name is None:
-            print(f"No specific sheet requested. Reading the first sheet from {file_path}")
+            logger.info(f"No specific sheet requested. Reading the first sheet from {file_path}")
             return pd.read_excel(file_path, engine="openpyxl")
         else:
-            print(f"Reading sheet '{sheet_name}' from {file_path}")
+            logger.info(f"Reading sheet '{sheet_name}' from {file_path}")
             return pd.read_excel(file_path, sheet_name=sheet_name, engine="openpyxl")
     except FileNotFoundError:
         raise FileNotFoundError(f"Excel file not found at path: {file_path}")
@@ -1547,6 +1548,17 @@ def set_lang(lang: str):
 #
 # ArXiv functionality
 #
+
+ARXIV_ID_PATTERN = re.compile(r"(\d{4}\.\d{4,5}|[a-z\-]+(?:\.[A-Z]{2})?/\d{7})(v\d+)?", re.IGNORECASE)
+
+
+def normalize_arxiv_id(paper_id: str) -> str:
+    """Accept 2301.12345, 2301.12345v2, arXiv:2301.12345, abs/pdf URLs or old-style hep-th/9901001; drop the version."""
+    match = ARXIV_ID_PATTERN.search(paper_id.strip())
+    if not match:
+        raise ValueError(f"Not a valid arXiv ID: {paper_id!r}")
+    return match.group(1)
+
 
 @mcp.tool()
 def search_papers(
@@ -1592,10 +1604,20 @@ def search_papers(
         if hasattr(r, "_raw") and isinstance(r._raw, dict):
             affiliation = r._raw.get("arxiv_affiliation")
 
+        arxiv_id = normalize_arxiv_id(r.entry_id)
         paper = {
+            "source": "arxiv",
             "title": r.title,
-            "pdf_url": r.pdf_url,
             "authors": [author.name for author in r.authors],
+            "year": r.published.year,
+            "doi": r.doi,
+            "abstract": r.summary,
+            "url": r.entry_id,
+            "arxiv_id": arxiv_id,
+            "arxiv_doi": f"10.48550/arXiv.{arxiv_id}",
+            "journal_ref": r.journal_ref,
+            "primary_category": r.primary_category,
+            "pdf_url": r.pdf_url,
             "summary": r.summary,
             "published": r.published.strftime("%Y-%m-%d"),
             "categories": r.categories,
@@ -1616,11 +1638,11 @@ def download_paper(paper_id: str) -> str:
     Args:
         paper_id: The ArXiv ID of the paper (e.g., "2301.12345" or the full URL)
     """
-    # Clean paper_id if it's a URL
-    clean_id = paper_id.split('/')[-1]
-    if clean_id.endswith('v'): # handle version numbers
-        clean_id = clean_id.split('v')[0]
-        
+    try:
+        clean_id = normalize_arxiv_id(paper_id)
+    except ValueError as e:
+        return f"Error: {e}"
+
     client = arxiv.Client()
     search = arxiv.Search(id_list=[clean_id])
     
@@ -1630,7 +1652,7 @@ def download_paper(paper_id: str) -> str:
         
         # Create filename
         safe_title = "".join([c if c.isalnum() else "_" for c in paper.title])
-        filename = f"{clean_id}_{safe_title[:50]}.pdf"
+        filename = f"{clean_id.replace('/', '_')}_{safe_title[:50]}.pdf"
         filepath = STORAGE_PATH / filename
         
         # Download
@@ -1660,6 +1682,39 @@ def build_garuda_detail_url(garuda_id_or_url: str) -> str:
     if garuda_id_or_url.startswith("http://") or garuda_id_or_url.startswith("https://"):
         return garuda_id_or_url
     return f"{GARUDA_BASE_URL}/documents/detail/{garuda_id_or_url}"
+
+
+GARUDA_DOI_PATTERN = re.compile(r"10\.\d{4,9}/[^\s\"'<>]+")
+GARUDA_YEAR_PATTERN = re.compile(r"\b(19|20)\d{2}\b")
+
+
+def extract_doi(value: str) -> str:
+    match = GARUDA_DOI_PATTERN.search(value or "")
+    return match.group(0).rstrip(".,;)") if match else ""
+
+
+def extract_year(value: str) -> int | None:
+    # Journal issue strings look like "Vol. 27 No. 1 (2026): January"; prefer the parenthesised year
+    match = re.search(r"\((\d{4})\)", value or "")
+    if match:
+        return int(match.group(1))
+    match = GARUDA_YEAR_PATTERN.search(value or "")
+    return int(match.group(0)) if match else None
+
+
+def classify_garuda_link(text: str, href: str) -> str:
+    """Identify an action link by its target first (stable) and its label second (layout-dependent)."""
+    if "doi.org/" in href or text.startswith("DOI:"):
+        return "doi"
+    if "scholar.google." in href or "Google Scholar" in text:
+        return "google_scholar"
+    if "Download Original" in text:
+        return "download_original"
+    if "Original Source" in text:
+        return "original_source"
+    if "Full PDF" in text:
+        return "full_pdf"
+    return ""
 
 
 def format_simple_apa_citation(article: Dict[str, Any]) -> str:
@@ -1712,27 +1767,31 @@ def parse_garuda_article_item(item, base_url: str = GARUDA_BASE_URL) -> Dict[str
     for link in links:
         text = clean_text(link.get_text(" ", strip=True))
         href = link.get("href", "")
+        kind = classify_garuda_link(text, href)
 
-        if "Download Original" in text:
-            download_original = href
-        elif "Original Source" in text:
-            original_source = href
-        elif "Check in Google Scholar" in text:
+        if kind == "doi":
+            doi = doi or extract_doi(href) or extract_doi(text)
+        elif kind == "google_scholar":
             google_scholar = href
-        elif "Full PDF" in text:
+        elif kind == "download_original":
+            download_original = href
+        elif kind == "original_source":
+            original_source = href
+        elif kind == "full_pdf":
             full_pdf = href
-        elif "DOI:" in text:
-            doi = text.replace("DOI:", "").strip()
 
     article = {
+        "source": "garuda",
         "garuda_id": garuda_id,
         "title": title,
         "authors": authors,
         "authors_text": "; ".join(authors),
+        "year": extract_year(journal),
         "journal": journal,
         "publisher": publisher,
         "abstract": abstract,
         "doi": doi,
+        "url": detail_url,
         "detail_url": detail_url,
         "download_original": download_original,
         "original_source": original_source,
@@ -1819,16 +1878,17 @@ def parse_garuda_detail_page(html: str, detail_url: str) -> Dict[str, Any]:
     for link in soup.select("a[href]"):
         text = clean_text(link.get_text(" ", strip=True))
         href = link.get("href", "")
-        if "Download Original" in text:
-            download_original = href
-        elif "Check in Google Scholar" in text or "Google Scholar" in text:
+        kind = classify_garuda_link(text, href)
+        if kind == "doi":
+            doi = doi or extract_doi(href) or extract_doi(text)
+        elif kind == "google_scholar":
             google_scholar = href
-        elif "Original Source" in text:
+        elif kind == "download_original":
+            download_original = href
+        elif kind == "original_source":
             original_source = href
-        elif "Full PDF" in text:
+        elif kind == "full_pdf":
             full_pdf = href
-        elif "DOI:" in text:
-            doi = text.replace("DOI:", "").strip()
 
     copyright_text = ""
     paragraphs = article_display.select("div.art-content p")
@@ -1836,7 +1896,9 @@ def parse_garuda_detail_page(html: str, detail_url: str) -> Dict[str, Any]:
         copyright_text = clean_text(paragraphs[-1].get_text(" ", strip=True))
 
     article = {
+        "source": "garuda",
         "garuda_id": extract_garuda_id_from_url(detail_url),
+        "url": detail_url,
         "detail_url": detail_url,
         "title": title,
         "journal_short": journal_short,
@@ -1845,6 +1907,7 @@ def parse_garuda_detail_page(html: str, detail_url: str) -> Dict[str, Any]:
         "authors": authors,
         "authors_text": "; ".join(authors),
         "publish_date": publish_date,
+        "year": extract_year(publish_date) or extract_year(journal_volume),
         "abstract": abstract,
         "copyright": copyright_text,
         "doi": doi,
@@ -2032,6 +2095,28 @@ async def get_garuda_detail(
 # IEEE Xplore functionality
 #
 
+IEEE_METADATA_PATTERN = re.compile(r"xplGlobal\.document\.metadata\s*=\s*(\{.*?\});\s*\n", re.DOTALL)
+
+
+def clean_ieee_text(text: str | None) -> str:
+    """Strip IEEE search highlight markers ([::term::]), HTML tags and entities."""
+    if not text:
+        return ""
+    text = re.sub(r"<[^>]+>", "", text.replace("[::", "").replace("::]", ""))
+    return html.unescape(re.sub(r"\s+", " ", text)).strip()
+
+
+def parse_ieee_document_metadata(page_html: str) -> dict:
+    """Read the JSON metadata IEEE embeds in every document page (abstract, doi, keywords, ...)."""
+    match = IEEE_METADATA_PATTERN.search(page_html)
+    if not match:
+        return {}
+    try:
+        return json.loads(match.group(1))
+    except ValueError:
+        return {}
+
+
 @mcp.tool()
 async def search_ieee(query: str, limit: int = 10, start_year: int = None, end_year: int = None) -> str:
     """
@@ -2054,20 +2139,17 @@ async def search_ieee(query: str, limit: int = 10, start_year: int = None, end_y
         "matchPubs": True
     }
     
-    # Add year range filter if provided
-    if start_year and end_year:
-        payload["ranges"] = [f"{start_year}_{end_year}_Year"]
-    elif start_year:
-        # If only start year, assume until current year + small buffer or max
-        import datetime
-        current_year = datetime.datetime.now().year + 1
-        payload["ranges"] = [f"{start_year}_{current_year}_Year"]
+    # Add year range filter if provided; an open end defaults to IEEE's earliest year / next year
+    if start_year or end_year:
+        start = start_year or 1800
+        end = end_year or datetime.now().year + 1
+        payload["ranges"] = [f"{start}_{end}_Year"]
     
     headers = {
         "Content-Type": "application/json",
         "Accept": "application/json, text/plain, */*",
         "Origin": "https://ieeexplore.ieee.org",
-        "Referer": f"https://ieeexplore.ieee.org/search/searchresult.jsp?newsearch=true&queryText={query}",
+        "Referer": f"https://ieeexplore.ieee.org/search/searchresult.jsp?newsearch=true&queryText={quote_plus(query)}",
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
     }
 
@@ -2095,14 +2177,15 @@ async def search_ieee(query: str, limit: int = 10, start_year: int = None, end_y
                         # Basic info
                         item = {
                             "index": index + 1,
+                            "source": "ieee",
                             "title": title,
                             "authors": [a.get("preferredName", "") for a in record.get("authors", [])],
                             "publication": record.get("publicationTitle", ""),
-                            "year": record.get("publicationYear", ""),
-                            "doi": record.get("doi", "N/A"),
+                            "year": int(record["publicationYear"]) if str(record.get("publicationYear", "")).isdigit() else None,
+                            "doi": record.get("doi") or None,
                             "url": f"https://ieeexplore.ieee.org/document/{article_number}" if article_number else "N/A",
                             "pdf_url": f"https://ieeexplore.ieee.org{record.get('pdfLink', '')}" if record.get('pdfLink') else "N/A",
-                            "abstract": record.get("abstract", "") # Default abstract
+                            "abstract": clean_ieee_text(record.get("abstract")), # search snippet; replaced by the full abstract below
                         }
 
                         # Fetch full abstract if possible/needed
@@ -2113,9 +2196,9 @@ async def search_ieee(query: str, limit: int = 10, start_year: int = None, end_y
                             doc_response = await client.get(item["url"], headers=headers)
                             if doc_response.status_code == 200:
                                 doc_text = doc_response.text
-                                match = re.search(r'"abstract":"(.*?)","isbn":', doc_text)
-                                if match:
-                                    item["abstract"] = match.group(1)
+                                metadata = parse_ieee_document_metadata(doc_text)
+                                if metadata.get("abstract"):
+                                    item["abstract"] = clean_ieee_text(metadata["abstract"])
                         
                         return item
                     except Exception as e:
@@ -2139,6 +2222,25 @@ async def search_ieee(query: str, limit: int = 10, start_year: int = None, end_y
 # ScienceDirect functionality
 #
 
+SCIENCEDIRECT_ABSTRACT_JS = r"""() => {
+    const selectors = [
+        '#abstracts',
+        '.Abstracts',
+        'div[class*="Abstract"]',
+        'section[id="abstracts"]',
+        '.abstract'
+    ];
+
+    for (const sel of selectors) {
+        const el = document.querySelector(sel);
+        if (el && el.innerText.trim().length > 20) {
+            return el.innerText.replace(/^(Abstract|Summary)\s*/i, '').trim();
+        }
+    }
+    return null;
+}"""
+
+
 @mcp.tool()
 async def search_sciencedirect(query: str, limit: int = 3) -> str:
     """
@@ -2148,10 +2250,11 @@ async def search_sciencedirect(query: str, limit: int = 3) -> str:
         query: The search query (e.g., "text-to-sql")
         limit: Max number of results to process (default: 3)
     """
-    print(f"Launching Browser (Persistent Context) to search for: {query}...")
+    logger.info(f"Launching Browser (Persistent Context) to search for: {query}...")
 
     # Create user_data directory if not exists
-    user_data_dir = os.path.join(os.getcwd(), "user_data")
+    # Anchored to this file rather than the MCP client's working directory, so the browser session persists
+    user_data_dir = os.getenv("SCIENCEDIRECT_USER_DATA_DIR") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "user_data")
     os.makedirs(user_data_dir, exist_ok=True)
 
     async with async_playwright() as p:
@@ -2187,12 +2290,12 @@ async def search_sciencedirect(query: str, limit: int = 3) -> str:
                 t_val = qs.get("t", [None])[0]
                 if t_val and not token_container["token"]:
                     token_container["token"] = t_val
-                    print("Token captured via network interception.")
+                    logger.info("Token captured via network interception.")
 
         page.on("request", handle_request)
 
         try:
-            print("Navigating to ScienceDirect...")
+            logger.info("Navigating to ScienceDirect...")
             # Navigate to generic search page to trigger token generation
             # URL encode the query
             import urllib.parse
@@ -2201,8 +2304,8 @@ async def search_sciencedirect(query: str, limit: int = 3) -> str:
             try:
                 await page.goto(f"https://www.sciencedirect.com/search?qs={encoded_query}", wait_until="domcontentloaded", timeout=60000)
             except Exception as e:
-                print(f"Navigation warning: {e}")
-                print("Continuing as the page might have loaded partially...")
+                logger.info(f"Navigation warning: {e}")
+                logger.info("Continuing as the page might have loaded partially...")
 
             # Wait a bit for token if not yet caught
             if not token_container["token"]:
@@ -2210,15 +2313,16 @@ async def search_sciencedirect(query: str, limit: int = 3) -> str:
                 
             # Manual intervention block
             if not token_container["token"]:
-                print("Token not yet captured. Waiting 15s for manual intervention if needed...")
-                await asyncio.sleep(15)
+                manual_wait = float(os.getenv("SCIENCEDIRECT_MANUAL_WAIT_SECONDS", "15"))
+                logger.info(f"Token not yet captured. Waiting {manual_wait:.0f}s for manual intervention if needed...")
+                await asyncio.sleep(manual_wait)
 
             token = token_container["token"]
             
             if not token:
-                return "Error: Could not capture ScienceDirect API token. Blocking may be active."
+                return json.dumps({"error": "Could not capture ScienceDirect API token. Blocking may be active."})
             
-            print("Token intercepted. Fetching metadata API...")
+            logger.info("Token intercepted. Fetching metadata API...")
 
             # Execute fetch inside browser context
             js_script = """
@@ -2240,79 +2344,58 @@ async def search_sciencedirect(query: str, limit: int = 3) -> str:
             results = await page.evaluate(js_script, {"token": token, "query": query})
 
             if not results or results.get("error"):
-                return f"API Call Failed: {results.get('error') if results else 'Unknown error'}"
+                return json.dumps({"error": f"API call failed: {results.get('error') if results else 'Unknown error'}"})
 
             search_results = results.get("searchResults", [])
             total_found = results.get("resultsFound", 0)
-            
-            print(f"Found {total_found} results. Processing top {limit}...")
+            process_count = min(len(search_results), limit)
 
-            output = f"# ScienceDirect Search Results for: '{query}'\n"
-            output += f"**Total Found:** {total_found} | **Showing Top:** {limit}\n\n"
-            
-            process_count = min(limit, len(search_results))
-            
+            logger.info(f"Found {total_found} results. Processing top {process_count}...")
+
+            papers = []
             for i in range(process_count):
                 record = search_results[i]
-                title = record.get("title", "No Title")
                 link = record.get("link", "")
                 if link and not link.startswith("http"):
                     link = "https://www.sciencedirect.com" + link
-                    
-                doi = record.get("doi", "N/A")
-                authors_list = record.get("authors", [])
-                authors = "; ".join([a.get("name") for a in authors_list]) if authors_list else "N/A"
+                year_match = re.search(r"\b(19|20)\d{2}\b", str(record.get("publicationDate") or ""))
 
-                print(f"[{i+1}/{process_count}] Navigating to extract abstract...")
-                
-                abstract = "Abstract could not be loaded"
-                
+                paper = {
+                    "index": i + 1,
+                    "source": "sciencedirect",
+                    "title": re.sub(r"<[^>]*>", "", record.get("title") or ""),
+                    "authors": [a.get("name") for a in record.get("authors") or [] if a.get("name")],
+                    "year": int(year_match.group(0)) if year_match else None,
+                    "doi": record.get("doi") or None,
+                    "abstract": None,
+                    "abstract_error": None,
+                    "url": link or None,
+                    "publication": record.get("sourceTitle") or None,
+                }
+
+                logger.info(f"[{i+1}/{process_count}] Navigating to extract abstract...")
                 try:
                     await page.goto(link, wait_until="domcontentloaded", timeout=45000)
                     await asyncio.sleep(2)
-                    
-                    abstract = await page.evaluate(r"""() => {
-                        const selectors = [
-                            '#abstracts', 
-                            '.Abstracts', 
-                            'div[class*="Abstract"]', 
-                            'section[id="abstracts"]',
-                            '.abstract'
-                        ];
-                        
-                        for (const sel of selectors) {
-                            const el = document.querySelector(sel);
-                            if (el && el.innerText.trim().length > 20) {
-                                return el.innerText.replace(/^(Abstract|Summary)\s*/i, '').trim();
-                            }
-                        }
-                        return null;
-                    }""")
-                    
-                    if not abstract:
-                        abstract = "Abstract section not found in the DOM (Access might be restricted)."
-                    
+                    paper["abstract"] = await page.evaluate(SCIENCEDIRECT_ABSTRACT_JS)
+                    if not paper["abstract"]:
+                        paper["abstract_error"] = "Abstract section not found in the DOM (access might be restricted)."
                 except Exception as e:
-                    abstract = f"(Page Load Error: {str(e)})"
-                
-                entry = f"""
-## {i+1}. {title}
-**Authors:** {authors}
-**DOI:** {doi}
-**Link:** [View Article]({link})
+                    paper["abstract_error"] = f"Page load error: {e}"
 
-### Abstract
-{abstract}
-
----
-"""
-                output += entry
+                papers.append(paper)
                 await asyncio.sleep(1)
+
+            return json.dumps({
+                "query": query,
+                "source": "sciencedirect",
+                "total_found": total_found,
+                "returned_results": len(papers),
+                "results": papers,
+            }, indent=2, ensure_ascii=False)
 
         finally:
             await context.close()
-            
-        return output
 
 @mcp.tool()
 def read_notebook(
