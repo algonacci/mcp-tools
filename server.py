@@ -19,9 +19,11 @@ import arxiv
 from pathlib import Path
 import httpx
 import asyncio
+import time
 from io import BytesIO
 import json
 from datetime import date, datetime, timezone
+from collections import Counter
 from urllib.parse import urljoin, urlparse, parse_qs, quote_plus
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import threading
@@ -2445,6 +2447,898 @@ async def search_sciencedirect(query: str, limit: int = 3) -> str:
                 await page.close()  # leave the user's browser and session running
             else:
                 await context.close()
+
+#
+# Crossref (scholarly metadata) functionality
+#
+
+CROSSREF_API_URL = "https://api.crossref.org"
+DOI_RESOLVER_URL = "https://doi.org"
+OPENALEX_API_URL = "https://api.openalex.org"
+
+# Contact email for Crossref's "polite" pool: no account needed, higher rate limit
+CROSSREF_MAILTO = os.getenv("CROSSREF_MAILTO", "")
+# Optional free key from openalex.org settings (10x the keyless daily budget); keyless works too
+OPENALEX_API_KEY = os.getenv("OPENALEX_API_KEY", "")
+
+CROSSREF_SELECT_FIELDS = [
+    "DOI", "title", "subtitle", "author", "container-title", "publisher", "type", "issued",
+    "published", "published-print", "published-online", "volume", "issue", "page", "ISSN",
+    "ISBN", "URL", "abstract", "subject", "license", "funder", "is-referenced-by-count",
+    "references-count", "score",
+]
+CROSSREF_CITATION_STYLES = {
+    "vancouver": "elsevier-vancouver",
+    "chicago": "chicago-author-date",
+    "mla": "modern-language-association",
+    "harvard": "harvard-cite-them-right",
+}
+CROSSREF_CITATION_FORMATS = {
+    "bibtex": "application/x-bibtex",
+    "ris": "application/x-research-info-systems",
+    "csl-json": "application/vnd.citationstyles.csl+json",
+}
+DOI_PATTERN = re.compile(r"10\.\d{4,9}/[^\s\"'<>]+", re.IGNORECASE)
+DOI_PREFIX_PATTERN = re.compile(r"^(https?://(dx\.)?doi\.org/|doi:\s*)", re.IGNORECASE)
+
+
+class CrossrefError(Exception):
+    def __init__(self, message: str, status: int | None = None):
+        super().__init__(message)
+        self.status = status
+
+
+_crossref_cache: dict[str, tuple[float, str]] = {}
+_crossref_throttle = {"next_request": 0.0, "interval": 0.35}
+_crossref_lock = asyncio.Lock()
+
+
+async def crossref_http_get(
+    url: str,
+    params: dict[str, Any] | None = None,
+    accept: str = "application/json",
+    cache_seconds: int = 3600,
+) -> str:
+    """GET with polite throttling, retry/backoff on 429/5xx and a small in-memory cache."""
+    params = {k: v for k, v in (params or {}).items() if v not in (None, "")}
+    if url.startswith(CROSSREF_API_URL) and CROSSREF_MAILTO:
+        params.setdefault("mailto", CROSSREF_MAILTO)
+    cache_key = f"{accept} {url} {sorted(params.items())}"
+    cached = _crossref_cache.get(cache_key)
+    if cached and cached[0] > time.monotonic():
+        return cached[1]
+
+    user_agent = "mcp-crossref/0.1" + (f" (mailto:{CROSSREF_MAILTO})" if CROSSREF_MAILTO else "")
+    host = httpx.URL(url).host
+    async with httpx.AsyncClient(timeout=30, follow_redirects=True, headers={"User-Agent": user_agent}) as client:
+        for attempt in range(4):
+            async with _crossref_lock:
+                wait = _crossref_throttle["next_request"] - time.monotonic()
+                if wait > 0:
+                    await asyncio.sleep(wait)
+                _crossref_throttle["next_request"] = time.monotonic() + _crossref_throttle["interval"]
+            try:
+                response = await client.get(url, params=params, headers={"Accept": accept})
+            except httpx.TransportError as e:
+                if attempt == 3:
+                    raise CrossrefError(f"Network error talking to {host}: {e}")
+                await asyncio.sleep(2**attempt)
+                continue
+
+            if host == "api.crossref.org":
+                # Crossref announces its per-pool rate limit on every response
+                limit = response.headers.get("x-rate-limit-limit", "")
+                interval = response.headers.get("x-rate-limit-interval", "1s").rstrip("s")
+                if limit.isdigit() and interval.replace(".", "", 1).isdigit():
+                    _crossref_throttle["interval"] = float(interval) / max(int(limit), 1)
+
+            if response.status_code == 200:
+                _crossref_cache[cache_key] = (time.monotonic() + cache_seconds, response.text)
+                return response.text
+            if response.status_code == 404:
+                raise CrossrefError(f"Not found: {url}", 404)
+            retry_after = response.headers.get("retry-after", "")
+            if response.status_code == 429 and retry_after.isdigit() and int(retry_after) > 60:
+                raise CrossrefError(f"{host} daily budget exhausted; resets in {int(retry_after) // 3600}h", 429)
+            if response.status_code in (429, 500, 502, 503, 504) and attempt < 3:
+                await asyncio.sleep(float(retry_after) if retry_after.isdigit() else 2**attempt)
+                continue
+            raise CrossrefError(f"{host} returned HTTP {response.status_code}: {response.text[:300]}", response.status_code)
+    raise CrossrefError(f"Exhausted retries for {url}")
+
+
+async def crossref_api(path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    return json.loads(await crossref_http_get(f"{CROSSREF_API_URL}{path}", params))["message"]
+
+
+async def openalex_api(path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    """OpenAlex call that uses OPENALEX_API_KEY when set and falls back to keyless if the key is rejected."""
+    global OPENALEX_API_KEY
+    auth = {"mailto": CROSSREF_MAILTO} if CROSSREF_MAILTO else {}
+    if OPENALEX_API_KEY:
+        auth["api_key"] = OPENALEX_API_KEY
+    try:
+        return json.loads(await crossref_http_get(f"{OPENALEX_API_URL}{path}", {**(params or {}), **auth}))
+    except CrossrefError as e:
+        if OPENALEX_API_KEY and e.status in (401, 403):
+            OPENALEX_API_KEY = ""
+            auth.pop("api_key", None)
+            return json.loads(await crossref_http_get(f"{OPENALEX_API_URL}{path}", {**(params or {}), **auth}))
+        raise
+
+
+def normalize_doi(value: str) -> str:
+    doi = DOI_PREFIX_PATTERN.sub("", (value or "").strip()).rstrip(".,;)]}")
+    if not DOI_PATTERN.fullmatch(doi):
+        raise ValueError(f"Not a valid DOI: {value!r}")
+    return doi.lower()
+
+
+def extract_dois(text: str) -> list[str]:
+    found: dict[str, None] = {}
+    for match in DOI_PATTERN.findall(text or ""):
+        try:
+            found.setdefault(normalize_doi(match), None)
+        except ValueError:
+            continue
+    return list(found)
+
+
+def build_crossref_filter(filters: dict[str, Any]) -> str | None:
+    parts = []
+    for name, value in filters.items():
+        if value is True:
+            parts.append(f"{name}:true")
+        elif value not in (None, "", False):
+            parts.append(f"{name}:{value}")
+    return ",".join(parts) or None
+
+
+def crossref_date(node: dict | None) -> str | None:
+    parts = ((node or {}).get("date-parts") or [[None]])[0]
+    if not parts or parts[0] is None:
+        return None
+    return "-".join([f"{parts[0]:04d}", *[f"{p:02d}" for p in parts[1:3]]])
+
+
+def strip_markup(text: str | None) -> str | None:
+    if not text:
+        return None
+    text = html.unescape(re.sub(r"<[^>]+>", " ", text))
+    text = re.sub(r"\s+", " ", text).strip()
+    return re.sub(r"^(abstract|summary)\s*[:.]?\s*", "", text, flags=re.IGNORECASE) or None
+
+
+def normalize_crossref_work(msg: dict[str, Any], include_abstract: bool = True, include_references: bool = False) -> dict[str, Any]:
+    published = (
+        crossref_date(msg.get("published"))
+        or crossref_date(msg.get("issued"))
+        or crossref_date(msg.get("published-print"))
+        or crossref_date(msg.get("published-online"))
+    )
+    work = {
+        "source": "crossref",
+        "doi": (msg.get("DOI") or "").lower() or None,
+        "title": strip_markup((msg.get("title") or [None])[0]),
+        "subtitle": strip_markup((msg.get("subtitle") or [None])[0]),
+        "authors": [
+            {
+                "name": a.get("name") or " ".join(x for x in (a.get("given"), a.get("family")) if x),
+                "orcid": (a.get("ORCID") or "").rsplit("/", 1)[-1] or None,
+                "affiliations": [af["name"] for af in a.get("affiliation", []) if af.get("name")],
+            }
+            for a in msg.get("author", [])
+        ],
+        "year": int(published[:4]) if published else None,
+        "publication_date": published,
+        "type": msg.get("type"),
+        "journal": (msg.get("container-title") or [None])[0],
+        "publisher": msg.get("publisher"),
+        "volume": msg.get("volume"),
+        "issue": msg.get("issue"),
+        "pages": msg.get("page"),
+        "issn": msg.get("ISSN", []),
+        "isbn": msg.get("ISBN", []),
+        "url": msg.get("URL"),
+        "subjects": msg.get("subject", []),
+        "cited_by_count": msg.get("is-referenced-by-count", 0),
+        "reference_count": msg.get("references-count", msg.get("reference-count", 0)),
+        "license": sorted({lic.get("URL") for lic in msg.get("license", []) if lic.get("URL")}),
+        "funders": [{"name": f.get("name"), "awards": f.get("award", [])} for f in msg.get("funder", [])],
+    }
+    if include_abstract:
+        work["abstract"] = strip_markup(msg.get("abstract"))
+    if include_references:
+        work["references"] = [
+            {
+                "doi": (r.get("DOI") or "").lower() or None,
+                "title": r.get("article-title") or r.get("volume-title"),
+                "author": r.get("author"),
+                "year": r.get("year"),
+                "journal": r.get("journal-title"),
+                "unstructured": r.get("unstructured"),
+            }
+            for r in msg.get("reference", [])
+        ]
+    if msg.get("score") is not None:
+        work["relevance_score"] = round(msg["score"], 2)
+    return work
+
+
+def crossref_metadata_quality(msg: dict[str, Any]) -> dict[str, Any]:
+    """Completeness of the deposited metadata. NOT a measure of scientific quality."""
+    authors = msg.get("author", [])
+    checks = {
+        "doi": bool(msg.get("DOI")),
+        "issn_or_isbn": bool(msg.get("ISSN") or msg.get("ISBN")),
+        "orcid": any(a.get("ORCID") for a in authors),
+        "authors": bool(authors),
+        "affiliations": any(a.get("affiliation") for a in authors),
+        "journal": bool(msg.get("container-title")),
+        "publication_date": bool(msg.get("published") or msg.get("issued")),
+        "volume": bool(msg.get("volume")),
+        "pages": bool(msg.get("page")),
+        "abstract": bool(msg.get("abstract")),
+        "references": bool(msg.get("reference")),
+        "license": bool(msg.get("license")),
+        "funding": bool(msg.get("funder")),
+    }
+    return {
+        "metadata_completeness": round(sum(checks.values()) / len(checks), 2),
+        "missing": [name for name, ok in checks.items() if not ok],
+    }
+
+
+def normalize_openalex_work(item: dict[str, Any]) -> dict[str, Any]:
+    source = (item.get("primary_location") or {}).get("source") or {}
+    index = item.get("abstract_inverted_index") or {}
+    abstract = " ".join(word for _, word in sorted((pos, w) for w, poss in index.items() for pos in poss)) or None
+    oa = item.get("open_access") or {}
+    return {
+        "source": "openalex",
+        "doi": (item.get("doi") or "").replace("https://doi.org/", "").lower() or None,
+        "openalex_id": item.get("id"),
+        "title": strip_markup(item.get("title")),
+        "authors": [{"name": a.get("author", {}).get("display_name")} for a in item.get("authorships", [])],
+        "year": item.get("publication_year"),
+        "type": item.get("type"),
+        "journal": source.get("display_name"),
+        "publisher": source.get("host_organization_name"),
+        "cited_by_count": item.get("cited_by_count", 0),
+        "open_access": {"is_oa": oa.get("is_oa"), "status": oa.get("oa_status"), "url": oa.get("oa_url")},
+        "abstract": abstract,
+    }
+
+
+def tokenize(text: str | None) -> list[str]:
+    return re.findall(r"[a-z0-9]+", (text or "").lower())
+
+
+def contains_phrase(text: str | None, phrase: str) -> bool:
+    haystack, needle = tokenize(text), tokenize(phrase)
+    return bool(needle) and any(haystack[i : i + len(needle)] == needle for i in range(len(haystack) - len(needle) + 1))
+
+
+def compact_work(work: dict[str, Any]) -> dict[str, Any]:
+    """Short form for lists: enough to judge relevance and follow up with get_crossref_work."""
+    return {
+        "doi": work.get("doi"),
+        "title": work.get("title"),
+        "authors": [a["name"] for a in work.get("authors", [])][:6],
+        "year": work.get("year"),
+        "journal": work.get("journal"),
+        "cited_by_count": work.get("cited_by_count", 0),
+    }
+
+
+@mcp.tool()
+async def search_crossref(
+    query: str = "",
+    author: str = "",
+    title: str = "",
+    bibliographic: str = "",
+    journal: str = "",
+    publisher: str = "",
+    affiliation: str = "",
+    funder: str = "",
+    from_date: str = "",
+    until_date: str = "",
+    work_type: str = "",
+    issn: str = "",
+    orcid: str = "",
+    has_abstract: bool = False,
+    has_full_text: bool = False,
+    sort: str = "relevance",
+    order: str = "desc",
+    rows: int = 10,
+    offset: int = 0,
+    include_abstract: bool = False,
+) -> dict[str, Any]:
+    """
+    Search ~170 million scholarly works registered in Crossref (all publishers: Elsevier, IEEE,
+    Springer, ACM, MDPI, Indonesian journals, ...). Every result carries a DOI you can pass to the
+    other crossref tools.
+
+    When to use:
+        - Broad literature discovery across publishers ("papers on X since 2022").
+        - Finding a specific paper from a messy citation string (use `bibliographic`).
+        - Listing an author's or a journal's works (use `author` / `orcid` / `issn`).
+
+    How matching works (important):
+        Crossref has NO exact-phrase search. `query="retrieval augmented generation"` matches any work
+        containing ANY of those words, so total_results is inflated and the tail is noise. Rely on the
+        top relevance-sorted results, add filters, or use analyze_crossref_topic for phrase-accurate trends.
+
+    Args:
+        query: Free-text keywords over all metadata, e.g. "graph neural network traffic forecasting".
+        author: Author name, e.g. "Geoffrey Hinton". Fuzzy; combine with `orcid` for precision.
+        title: Words that should appear in the title.
+        bibliographic: A full or partial citation string, e.g.
+            "LeCun Bengio Hinton 2015 Deep learning Nature". Best tool for "find this exact paper".
+        journal: Journal / proceedings name, e.g. "Expert Systems with Applications".
+        publisher: Publisher name, e.g. "IEEE".
+        affiliation: Author affiliation text, e.g. "Universitas Indonesia" (only works where deposited).
+        funder: Funder name, e.g. "LPDP" or "National Science Foundation".
+        from_date: Earliest publication date, "YYYY", "YYYY-MM" or "YYYY-MM-DD".
+        until_date: Latest publication date, same formats.
+        work_type: Crossref type id, e.g. "journal-article", "proceedings-article", "book-chapter",
+            "posted-content" (preprints), "dissertation", "dataset".
+        issn: Restrict to one journal by ISSN, e.g. "0957-4174".
+        orcid: Restrict to works carrying this ORCID iD, e.g. "0000-0002-1825-0097".
+        has_abstract: Only works with a deposited abstract (many publishers do not deposit them).
+        has_full_text: Only works with full-text links deposited (does NOT mean open access).
+        sort: "relevance" (default), "published", "is-referenced-by-count" (most cited),
+            "references-count", "updated", "created".
+        order: "desc" (default) or "asc".
+        rows: Results to return, 1-100 (default 10).
+        offset: Skip this many results for paging (Crossref caps offset at 10,000).
+        include_abstract: Add abstracts to results (longer output). Default False to save tokens;
+            fetch a single paper's abstract with get_crossref_work instead.
+
+    Returns:
+        {"total_results": int, "returned_results": int, "items": [work, ...]} where each work has
+        doi, title, authors, year, journal, publisher, type, cited_by_count, reference_count, url, ...
+
+    Examples:
+        search_crossref(query="large language model education", from_date="2023", work_type="journal-article")
+        search_crossref(author="Yoshua Bengio", sort="is-referenced-by-count", rows=5)
+        search_crossref(bibliographic="Vaswani 2017 Attention is all you need")
+        search_crossref(query="deep learning", issn="2169-3536", sort="published")
+
+    Note: cited_by_count counts only citations registered in Crossref; it is not a quality measure.
+    """
+    rows = max(1, min(rows, 100))
+    params = {
+        "query": query,
+        "query.author": author,
+        "query.title": title,
+        "query.bibliographic": bibliographic,
+        "query.container-title": journal,
+        "query.publisher-name": publisher,
+        "query.affiliation": affiliation,
+        "query.funder-name": funder,
+        "filter": build_crossref_filter({
+            "from-pub-date": from_date,
+            "until-pub-date": until_date,
+            "type": work_type,
+            "issn": issn,
+            "orcid": orcid,
+            "has-abstract": has_abstract,
+            "has-full-text": has_full_text,
+        }),
+        "sort": sort,
+        "order": order,
+        "rows": rows,
+        "offset": offset or None,
+        "select": ",".join(CROSSREF_SELECT_FIELDS),
+    }
+    message = await crossref_api("/works", params)
+    items = [normalize_crossref_work(item, include_abstract=include_abstract) for item in message.get("items", [])]
+    return {
+        "total_results": message.get("total-results", 0),
+        "returned_results": len(items),
+        "items": items,
+    }
+
+
+@mcp.tool()
+async def get_crossref_work(doi: str) -> dict[str, Any]:
+    """
+    Get the complete, normalized metadata record for one DOI.
+
+    When to use:
+        - You have a DOI (from any search tool, a PDF, a reference list) and need authors with ORCID
+          and affiliations, journal, volume/issue/pages, abstract, license, funders, citation counts.
+        - Checking whether a DOI is real before citing it (a 404 means Crossref does not know it).
+
+    Args:
+        doi: Any DOI spelling: "10.1145/3065386", "https://doi.org/10.1145/3065386",
+            "doi:10.1145/3065386". Case does not matter.
+
+    Returns:
+        The work record plus "metadata_quality": {"metadata_completeness": 0-1, "missing": [...]},
+        which tells you which fields the publisher did not deposit (e.g. abstract). It describes the
+        metadata only, never the scientific quality of the paper.
+
+    Tips:
+        - abstract is often null because many publishers do not deposit abstracts to Crossref;
+          snowball_doi returns OpenAlex's abstract when it has one.
+        - arXiv DOIs (10.48550/arXiv.*) are registered with DataCite, not Crossref, so this returns
+          "not found"; cite_dois still works for them.
+        - Use get_crossref_references for the reference list.
+    """
+    message = await crossref_api(f"/works/{normalize_doi(doi)}")
+    work = normalize_crossref_work(message)
+    work["metadata_quality"] = crossref_metadata_quality(message)
+    return work
+
+
+@mcp.tool()
+async def cite_dois(dois: list[str], style: str = "apa") -> dict[str, Any]:
+    """
+    Format citations for one or more DOIs in any citation style or export format.
+
+    Uses DOI content negotiation, so it works for Crossref AND DataCite DOIs (arXiv, Zenodo, ...).
+
+    When to use:
+        - Building a bibliography / reference list for a thesis or paper.
+        - Exporting references to Zotero, Mendeley or EndNote (bibtex / ris).
+
+    Args:
+        dois: List of DOIs (max 50), e.g. ["10.1038/nature14539", "10.1145/3065386"].
+        style: Citation style or export format:
+            - "apa" (default), "ieee", "vancouver", "chicago", "mla", "harvard", "nature"
+            - any other CSL style id from https://github.com/citation-style-language/styles,
+              e.g. "american-medical-association"
+            - "bibtex", "ris" or "csl-json" for reference-manager exports
+
+    Returns:
+        {"style": str, "citations": [{"doi": str, "citation": str}], "failed": [{"doi", "error"}]}
+
+    Example:
+        cite_dois(["10.1038/nature14539"], style="ieee")
+        -> "Y. LeCun, Y. Bengio, and G. Hinton, “Deep learning,” Nature, vol. 521, no. 7553, ..."
+    """
+    style_key = style.strip().lower()
+    accept = CROSSREF_CITATION_FORMATS.get(style_key) or (
+        f"text/x-bibliography; style={CROSSREF_CITATION_STYLES.get(style_key, style_key)}; locale=en-US"
+    )
+    citations, failed = [], []
+    for raw in dois[:50]:
+        try:
+            doi = normalize_doi(raw)
+            text = (await crossref_http_get(f"{DOI_RESOLVER_URL}/{doi}", accept=accept, cache_seconds=86400)).strip()
+            if style_key not in CROSSREF_CITATION_FORMATS:
+                # DataCite returns HTML-formatted text styles; numbered styles prefix "[1]" or "1."
+                text = html.unescape(re.sub(r"<[^>]+>", "", text))
+                text = re.sub(r"^(\[\d+\]|\d+\.)\s*", "", text)
+            citations.append({"doi": doi, "citation": text})
+        except (ValueError, CrossrefError) as e:
+            failed.append({"doi": raw, "error": str(e)})
+    return {"style": style, "citations": citations, "failed": failed}
+
+
+@mcp.tool()
+async def resolve_dois(text: str, max_dois: int = 25) -> dict[str, Any]:
+    """
+    Find every DOI mentioned in free text and resolve each one to clean metadata.
+
+    When to use:
+        - The user pastes a messy reference list, a PDF's text, notes or a URL list and wants to know
+          what the papers are, check that the DOIs exist, or turn them into a clean table.
+        - Verifying DOIs produced by another tool or model before citing them.
+
+    Args:
+        text: Any text containing DOIs in any form ("doi:10.x/y", "https://doi.org/10.x/y", bare).
+        max_dois: Resolve at most this many unique DOIs (default 25, max 100).
+
+    Returns:
+        {"found": int, "works": [compact work], "failed": [{"doi", "error"}]}. A DOI in "failed"
+        with "Not found" is unknown to Crossref (typo, fabricated, or registered with DataCite).
+
+    Follow-up: pass the resolved DOIs to cite_dois to format a bibliography.
+    """
+    dois = extract_dois(text)
+    works, failed = [], []
+    for doi in dois[: max(1, min(max_dois, 100))]:
+        try:
+            works.append(compact_work(normalize_crossref_work(await crossref_api(f"/works/{doi}"), include_abstract=False)))
+        except CrossrefError as e:
+            failed.append({"doi": doi, "error": str(e)})
+    return {"found": len(dois), "works": works, "failed": failed}
+
+
+@mcp.tool()
+async def get_crossref_references(doi: str, resolve: int = 0) -> dict[str, Any]:
+    """
+    List the references (bibliography) of a paper, i.e. the older works it cites.
+
+    When to use:
+        - Backward snowballing in a literature review: find the foundational papers a key paper builds on.
+        - Checking which sources a paper relies on.
+
+    Args:
+        doi: DOI of the citing paper.
+        resolve: Also fetch full metadata for the first N references that have a DOI (max 20),
+            sorted by citation count, to spot the most influential ones. Default 0 (no extra calls).
+
+    Returns:
+        {"doi", "title", "reference_count", "references": [{doi, title, author, year, journal,
+        unstructured}], "resolved": [compact work]}
+
+    Notes:
+        - Only references the publisher deposited are available; some publishers deposit none.
+        - Crossref does not expose the reverse direction (papers that cite this one); use snowball_doi.
+    """
+    message = await crossref_api(f"/works/{normalize_doi(doi)}")
+    work = normalize_crossref_work(message, include_abstract=False, include_references=True)
+    resolved = []
+    for ref in [r for r in work["references"] if r["doi"]][: max(0, min(resolve, 20))]:
+        try:
+            resolved.append(compact_work(normalize_crossref_work(await crossref_api(f"/works/{ref['doi']}"), include_abstract=False)))
+        except CrossrefError:
+            continue
+    return {
+        "doi": work["doi"],
+        "title": work["title"],
+        "reference_count": work["reference_count"],
+        "references": work["references"],
+        "resolved": sorted(resolved, key=lambda w: -w["cited_by_count"]),
+    }
+
+
+@mcp.tool()
+async def find_related_works(doi: str, rows: int = 10) -> dict[str, Any]:
+    """
+    Find works bibliographically similar to a given paper (same title vocabulary and subjects).
+
+    When to use:
+        - "More like this" from one good paper, without needing its references or citations.
+
+    Args:
+        doi: DOI of the seed paper.
+        rows: Number of similar works to return (1-50, default 10).
+
+    Returns:
+        {"seed": compact work, "related": [compact work + relevance_score]}
+
+    Tip: snowball_doi gives citation-based neighbours (references, citing works, OpenAlex related),
+    which are usually more meaningful than text similarity.
+    """
+    seed = normalize_crossref_work(await crossref_api(f"/works/{normalize_doi(doi)}"), include_abstract=False)
+    message = await crossref_api("/works", {
+        "query.bibliographic": " ".join(filter(None, [seed["title"], seed["subtitle"], *seed["subjects"][:3]])),
+        "rows": max(1, min(rows, 50)) + 5,
+        "select": ",".join(CROSSREF_SELECT_FIELDS),
+    })
+    related = []
+    for item in message.get("items", []):
+        work = normalize_crossref_work(item, include_abstract=False)
+        if work["doi"] != seed["doi"] and work["title"] != seed["title"]:
+            related.append({**compact_work(work), "relevance_score": work.get("relevance_score")})
+    return {"seed": compact_work(seed), "related": related[:rows]}
+
+
+@mcp.tool()
+async def analyze_crossref_topic(
+    phrase: str,
+    scan: int = 500,
+    from_year: int | None = None,
+    until_year: int | None = None,
+    work_type: str = "",
+) -> dict[str, Any]:
+    """
+    Describe a research topic: publications per year, top venues, publishers and funders, and the
+    most cited works, counting only titles that contain the exact phrase.
+
+    When to use:
+        - Trend questions: "is X growing?", "when did X take off?", thesis/proposal background.
+        - "Where is X published?", "who funds X?" (venue and funder landscape).
+
+    How it works:
+        Crossref has no phrase search, so a plain query for "retrieval augmented generation" matches
+        about a million works. This tool scans the top `scan` relevance-ranked hits and keeps only
+        works whose title contains the exact phrase, then aggregates them. It is a sample of the most
+        relevant works, not a complete count; older years may be under-represented.
+
+    Args:
+        phrase: The topic phrase, e.g. "retrieval augmented generation" (hyphens/case ignored).
+        scan: Relevance hits to scan, 100-2000 (default 500). Larger = slower but more complete.
+        from_year: Optional earliest publication year.
+        until_year: Optional latest publication year.
+        work_type: Optional Crossref type, e.g. "journal-article".
+
+    Returns:
+        {"phrase", "fuzzy_total" (all keyword matches, for context), "scanned", "matched",
+         "per_year": {year: count}, "top_venues", "top_publishers", "top_funders": [[name, count]],
+         "most_cited": [compact work]}
+
+    Counts describe metadata only; they do not rank venue or funder quality.
+    """
+    scan = max(100, min(scan, 2000))
+    filters = build_crossref_filter({
+        "from-pub-date": str(from_year) if from_year else None,
+        "until-pub-date": f"{until_year}-12-31" if until_year else None,
+        "type": work_type,
+    })
+    fuzzy_total = (await crossref_api("/works", {"query": phrase, "filter": filters, "rows": 0})).get("total-results", 0)
+    matched, scanned, cursor = [], 0, "*"
+    while scanned < scan and cursor:
+        message = await crossref_api("/works", {
+            "query": phrase,
+            "filter": filters,
+            "rows": min(100, scan - scanned),
+            "cursor": cursor,
+            # cursor paging does not rank by relevance unless asked to
+            "sort": "relevance",
+            "select": "DOI,title,subtitle,author,container-title,publisher,issued,published,funder,is-referenced-by-count",
+        })
+        items = message.get("items", [])
+        if not items:
+            break
+        scanned += len(items)
+        cursor = message.get("next-cursor")
+        for item in items:
+            work = normalize_crossref_work(item, include_abstract=False)
+            if contains_phrase(f"{work['title']} {work['subtitle'] or ''}", phrase):
+                matched.append(work)
+    unique = list({w["doi"]: w for w in matched}.values())
+    return {
+        "phrase": phrase,
+        "fuzzy_total": fuzzy_total,
+        "scanned": scanned,
+        "matched": len(unique),
+        "per_year": dict(sorted(Counter(w["year"] for w in unique if w["year"]).items())),
+        "top_venues": Counter(w["journal"] for w in unique if w["journal"]).most_common(8),
+        "top_publishers": Counter(w["publisher"] for w in unique if w["publisher"]).most_common(8),
+        "top_funders": Counter(f["name"] for w in unique for f in w["funders"] if f["name"]).most_common(8),
+        "most_cited": [compact_work(w) for w in sorted(unique, key=lambda w: -w["cited_by_count"])[:10]],
+    }
+
+
+@mcp.tool()
+async def get_crossref_author(name: str, orcid: str = "", max_works: int = 100) -> dict[str, Any]:
+    """
+    Build an author profile: publications, years active, frequent co-authors, venues, affiliations
+    and ORCID iDs seen in Crossref metadata.
+
+    When to use:
+        - "Who is this researcher / what do they work on / who do they collaborate with?"
+        - Finding collaborators or research groups around a person.
+
+    Args:
+        name: Author name, e.g. "Geoffrey Hinton". Matching is fuzzy, so namesakes can be mixed in.
+        orcid: ORCID iD (e.g. "0000-0002-1825-0097"). When given, only works carrying this iD are used,
+            which removes namesakes. If the result lists several ORCID iDs, rerun with one of them.
+        max_works: Works to scan, 20-500 (default 100).
+
+    Returns:
+        {"name", "orcid_filter", "scanned", "matched", "total_citations", "years": {year: count},
+         "orcids_seen", "affiliations", "coauthors", "venues": [[name, count]],
+         "most_cited": [compact work]}
+
+    Counts describe Crossref metadata, not research impact; centrality is not quality.
+    """
+    max_works = max(20, min(max_works, 500))
+    # cursor paging does not rank by relevance unless asked to
+    params: dict[str, Any] = {"select": ",".join(CROSSREF_SELECT_FIELDS), "rows": min(100, max_works), "sort": "relevance"}
+    if orcid:
+        params["filter"] = build_crossref_filter({"orcid": orcid})
+    else:
+        params["query.author"] = name
+    raw, cursor = [], "*"
+    while len(raw) < max_works and cursor:
+        message = await crossref_api("/works", {**params, "cursor": cursor, "rows": min(100, max_works - len(raw))})
+        items = message.get("items", [])
+        if not items:
+            break
+        raw += items
+        cursor = message.get("next-cursor")
+
+    name_tokens = tokenize(name)
+    works, seen = [], set()
+    coauthors, venues, years, orcids, affiliations = Counter(), Counter(), Counter(), Counter(), Counter()
+    for item in raw:
+        work = normalize_crossref_work(item, include_abstract=False)
+        if orcid:
+            me = next((a for a in work["authors"] if a["orcid"] == orcid), None)
+        else:
+            # surname must match exactly, given names by initial
+            me = next((a for a in work["authors"] if name_tokens and tokenize(a["name"])[-1:] == name_tokens[-1:]
+                       and all(any(t.startswith(n[0]) for t in tokenize(a["name"])) for n in name_tokens[:-1])), None)
+        if not me or work["doi"] in seen:
+            continue
+        seen.add(work["doi"])
+        works.append(work)
+        coauthors.update(a["name"] for a in work["authors"] if a is not me and a["name"])
+        if work["journal"]:
+            venues[work["journal"]] += 1
+        if work["year"]:
+            years[work["year"]] += 1
+        if me["orcid"]:
+            orcids[me["orcid"]] += 1
+        affiliations.update(me["affiliations"])
+    return {
+        "name": name,
+        "orcid_filter": orcid or None,
+        "scanned": len(raw),
+        "matched": len(works),
+        "total_citations": sum(w["cited_by_count"] for w in works),
+        "years": dict(sorted(years.items())),
+        "orcids_seen": orcids.most_common(5),
+        "affiliations": affiliations.most_common(5),
+        "coauthors": coauthors.most_common(15),
+        "venues": venues.most_common(10),
+        "most_cited": [compact_work(w) for w in sorted(works, key=lambda w: -w["cited_by_count"])[:10]],
+    }
+
+
+@mcp.tool()
+async def get_crossref_journal(issn_or_name: str, latest: int = 5) -> dict[str, Any]:
+    """
+    Look up a journal: publisher, ISSNs, subjects, DOI counts, metadata coverage and latest works.
+
+    When to use:
+        - "Tell me about journal X", "what does X publish lately?", "does X deposit abstracts/ORCIDs?"
+        - Finding a journal's ISSN from its name (then filter search_crossref by issn).
+
+    Args:
+        issn_or_name: An ISSN like "0957-4174" for the full profile, or a name like
+            "expert systems with applications" to list matching journals with their ISSNs.
+        latest: Number of most recent works to include for an ISSN lookup (0-20, default 5).
+
+    Returns:
+        For an ISSN: {"title", "publisher", "issn", "subjects", "total_dois", "coverage" (share of
+        current works with abstracts, ORCIDs, references, licenses, ...), "dois_by_year", "latest"}.
+        For a name: {"matches": [{"title", "publisher", "issn", "total_dois"}]}.
+
+    Coverage is metadata completeness, not a journal quality ranking.
+    """
+    value = issn_or_name.strip()
+    if not re.fullmatch(r"\d{4}-\d{3}[\dXx]", value):
+        message = await crossref_api("/journals", {"query": value, "rows": 10})
+        return {
+            "matches": [
+                {
+                    "title": j.get("title"),
+                    "publisher": j.get("publisher"),
+                    "issn": j.get("ISSN", []),
+                    "total_dois": j.get("counts", {}).get("total-dois", 0),
+                }
+                for j in message.get("items", [])
+            ]
+        }
+    journal = await crossref_api(f"/journals/{value}")
+    latest_works = []
+    if latest > 0:
+        message = await crossref_api(f"/journals/{value}/works", {
+            "rows": min(latest, 20), "sort": "published", "order": "desc", "select": ",".join(CROSSREF_SELECT_FIELDS),
+        })
+        latest_works = [compact_work(normalize_crossref_work(i, include_abstract=False)) for i in message.get("items", [])]
+    coverage = journal.get("coverage", {})
+    return {
+        "title": journal.get("title"),
+        "publisher": journal.get("publisher"),
+        "issn": journal.get("ISSN", []),
+        "subjects": [s.get("name") for s in journal.get("subjects", [])],
+        "total_dois": journal.get("counts", {}).get("total-dois", 0),
+        "coverage": {k.removesuffix("-current"): round(v, 2) for k, v in sorted(coverage.items()) if k.endswith("-current")},
+        "dois_by_year": dict(sorted(journal.get("breakdowns", {}).get("dois-by-issued-year") or [])[-15:]),
+        "latest": latest_works,
+    }
+
+
+@mcp.tool()
+async def get_crossref_funder(name_or_id: str, latest: int = 5) -> dict[str, Any]:
+    """
+    Look up a research funder and the works it funded (as declared by publishers in Crossref).
+
+    When to use:
+        - "What has LPDP / NSF / Horizon Europe funded?", grant output tracking, funder landscape.
+
+    Args:
+        name_or_id: Funder name ("LPDP", "National Science Foundation") or Crossref Funder ID
+            ("501100014538").
+        latest: Number of most recent funded works to include (0-20, default 5).
+
+    Returns:
+        {"funder": {"id", "name", "location", "alt_names"}, "other_matches", "funded_works_total",
+         "per_year": {year: count}, "top_venues": [[name, count]], "latest": [compact work]}
+    """
+    if name_or_id.strip().isdigit():
+        funder = await crossref_api(f"/funders/{name_or_id.strip()}")
+        others = []
+    else:
+        matches = (await crossref_api("/funders", {"query": name_or_id, "rows": 5})).get("items", [])
+        if not matches:
+            return {"error": f"No funder matches {name_or_id!r}"}
+        funder, others = matches[0], matches[1:]
+    message = await crossref_api(f"/funders/{funder['id']}/works", {
+        "rows": max(0, min(latest, 20)),
+        "sort": "published",
+        "order": "desc",
+        "facet": "published:40,container-title:8",
+        "select": ",".join(CROSSREF_SELECT_FIELDS),
+    })
+    facets = message.get("facets", {})
+    return {
+        "funder": {
+            "id": funder.get("id"),
+            "name": funder.get("name"),
+            "location": funder.get("location"),
+            "alt_names": funder.get("alt-names", [])[:8],
+        },
+        "other_matches": [{"id": f.get("id"), "name": f.get("name")} for f in others],
+        "funded_works_total": message.get("total-results", 0),
+        "per_year": dict(sorted((int(y), c) for y, c in facets.get("published", {}).get("values", {}).items() if y.isdigit())),
+        "top_venues": list(facets.get("container-title", {}).get("values", {}).items()),
+        "latest": [compact_work(normalize_crossref_work(i, include_abstract=False)) for i in message.get("items", [])],
+    }
+
+
+@mcp.tool()
+async def snowball_doi(doi: str, rows: int = 10) -> dict[str, Any]:
+    """
+    Citation snowballing around one paper: its references (backward), the works that cite it
+    (forward), and related works, plus open-access status and an abstract when available.
+
+    Forward citations are not available from Crossref, so this tool uses OpenAlex (free; set
+    OPENALEX_API_KEY for a 10x daily budget, otherwise it runs keyless).
+
+    When to use:
+        - Systematic literature review snowballing from one or two seed papers.
+        - "Who built on this paper?", "what newer work cites it?", "is there a free PDF?"
+
+    Args:
+        doi: DOI of the seed paper.
+        rows: Works per direction, sorted by citation count (1-50, default 10).
+
+    Returns:
+        {"seed": work with open_access + abstract, "backward_total", "backward": [...],
+         "forward_total", "forward": [...], "related": [...],
+         "strong_candidates": works found by more than one direction}
+
+    Notes:
+        - OpenAlex matching is automatic and occasionally wrong; sanity-check odd entries.
+        - open_access.url is a legal free copy when OpenAlex knows one; DOI != free PDF.
+        - Costs about 4 OpenAlex list calls; single lookups are free.
+    """
+    rows = max(1, min(rows, 50))
+    seed = await openalex_api(f"/works/doi:{normalize_doi(doi)}")
+
+    async def by_ids(ids: list[str]) -> list[dict[str, Any]]:
+        out = []
+        for i in range(0, len(ids), 100):
+            chunk = "|".join(x.rsplit("/", 1)[-1] for x in ids[i : i + 100])
+            out += (await openalex_api("/works", {"filter": f"openalex:{chunk}", "per_page": 100})).get("results", [])
+        return [normalize_openalex_work(w) for w in out]
+
+    backward = await by_ids(seed.get("referenced_works", []))
+    citing = await openalex_api("/works", {
+        "filter": f"cites:{seed['id'].rsplit('/', 1)[-1]}", "per_page": rows, "sort": "cited_by_count:desc",
+    })
+    forward = [normalize_openalex_work(w) for w in citing.get("results", [])]
+    related = await by_ids(seed.get("related_works", [])[:rows])
+
+    def top(works: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [{**compact_work(w), "open_access": w["open_access"]["is_oa"]}
+                for w in sorted(works, key=lambda w: -w["cited_by_count"])[:rows]]
+
+    seen: Counter = Counter()
+    for group in (backward, forward, related):
+        seen.update({w["doi"] for w in group if w["doi"]})
+    all_works = {w["doi"]: w for w in backward + forward + related if w["doi"]}
+    return {
+        "seed": normalize_openalex_work(seed),
+        "backward_total": len(backward),
+        "backward": top(backward),
+        "forward_total": citing.get("meta", {}).get("count", 0),
+        "forward": top(forward),
+        "related": top(related),
+        "strong_candidates": [compact_work(all_works[d]) for d, n in seen.most_common() if n > 1][:rows],
+        "retrieved_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+
 
 @mcp.tool()
 def read_notebook(

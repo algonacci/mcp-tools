@@ -47,6 +47,25 @@ keyword search does not reliably match on author names. Additional filters:
 `publisher` (name, min. 3 characters), `pdf_only` (downloadable PDF only),
 and `year_from`/`year_to` (publication year range).
 
+## Crossref scholarly metadata
+
+Crossref tools search ~170 million works from every publisher and need no API key.
+Set `CROSSREF_MAILTO` to join Crossref's faster "polite" pool, and optionally
+`OPENALEX_API_KEY` (free) for a larger `snowball_doi` budget; it runs keyless otherwise.
+
+- `search_crossref`: keyword, author, citation-string (`bibliographic`), journal, funder and date/type filters
+- `get_crossref_work`: full record for a DOI plus which metadata fields are missing
+- `cite_dois`: APA, IEEE, Vancouver, Chicago, MLA, Harvard, any CSL style, BibTeX, RIS (arXiv DOIs too)
+- `resolve_dois`: verify every DOI found in pasted text
+- `get_crossref_references`, `find_related_works`, `snowball_doi`: references, similar works,
+  and works citing a paper (OpenAlex) for literature-review snowballing
+- `analyze_crossref_topic`, `get_crossref_author`, `get_crossref_journal`, `get_crossref_funder`:
+  topic trends, researcher, journal and funder profiles
+
+Crossref has no exact-phrase search, so plain queries match any word; `analyze_crossref_topic`
+counts only titles containing the exact phrase. The same tools ship standalone in
+[mcp-crossref](https://github.com/algonacci/mcp-crossref).
+
 ## PlantUML
 
 `render_plantuml` renders source containing `@startuml` and `@enduml` as PNG

@@ -12,7 +12,10 @@ Already covered by `server.py` — do not duplicate: database access (`connect_d
 `get_top_news`, `get_topic_news`), web search (`tavily_search`, `search`, `extract_url`), PDF/Excel/
 notebook reading (`read_pdf`, `read_excel`, `read_notebook`), Wikipedia (`summary`, `page`,
 `random`, `set_lang`), academic papers (`search_papers`, `download_paper`, `search_garuda`,
-`get_garuda_detail`, `search_ieee`, `search_sciencedirect`), and crypto/market data (`get_price`,
+`get_garuda_detail`, `search_ieee`, `search_sciencedirect`), Crossref scholarly metadata (`search_crossref`,
+`get_crossref_work`, `cite_dois`, `resolve_dois`, `get_crossref_references`, `find_related_works`,
+`analyze_crossref_topic`, `get_crossref_author`, `get_crossref_journal`, `get_crossref_funder`,
+`snowball_doi`), and crypto/market data (`get_price`,
 `get_coin_detail`, `get_top_coins`, `search_coin`, `get_global_market`, `get_price_history`,
 `compare_coins`), and email (`connect`, `health`, `list_folders`, `latest_emails`, `read_email`,
 `search_emails`, `send_email`, `mark_read`, `mark_unread`, `delete_email`, `list_attachments`,
