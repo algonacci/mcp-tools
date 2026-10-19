@@ -9,7 +9,8 @@ commands, scheduling, memory. See kumo's ROADMAP.md (Phase 4c) for that split in
 
 Already covered by `server.py` — do not duplicate: database access (`connect_database`,
 `execute_query`, `list_tables`, `describe_table`, `disconnect_database`), news (`search_news`,
-`get_top_news`, `get_topic_news`), web search (`tavily_search`, `search`, `extract_url`), PDF/Excel/
+`get_top_news`, `get_topic_news`), web search (`tavily_search`, `search`, `extract_url`, `exa_search`,
+`exa_get_contents`, `exa_deep_search`, `exa_research_start`, `exa_research_get`), PDF/Excel/
 notebook reading (`read_pdf`, `read_excel`, `read_notebook`), Wikipedia (`summary`, `page`,
 `random`, `set_lang`), academic papers (`search_papers`, `download_paper`, `search_garuda`,
 `get_garuda_detail`, `search_ieee`, `search_sciencedirect`), Crossref scholarly metadata (`search_crossref`,

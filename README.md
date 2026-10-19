@@ -37,6 +37,23 @@ Use `inspect_data_file` first to discover sheets, columns, data types, and sampl
 For dummy, generated, or small datasets, `create_inline_data_chart` accepts records
 directly and returns the PNG without creating a script or temporary data file.
 
+## Exa web search
+
+Exa tools need `EXA_API_KEY`; the free tier gives $10 of credits per month and every
+response includes `cost_dollars`.
+
+- `exa_search`: web search with highlights or full text; filters for category
+  (`company`, `news`, `publication`, `people`, ...), domains, and published-date range
+- `exa_get_contents`: read known URLs, optionally only the passages relevant to a query
+- `exa_deep_search`: multi-step search that synthesizes a cited answer, as text or
+  shaped by a JSON Schema (`output_schema`)
+- `exa_research_start` / `exa_research_get`: Exa's research agent for lists and reports.
+  Runs take minutes, so `start` returns a `run_id` and `get` waits up to 50 seconds per call
+
+Results are capped at 25, URLs at 10 per call, and research effort at `medium` to keep a
+single call from draining the budget. The same tools ship standalone in
+[mcp-exa](https://github.com/algonacci/mcp-exa).
+
 ## GARUDA academic search
 
 `search_garuda` mirrors the filters on GARUDA's own search form
