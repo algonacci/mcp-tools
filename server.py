@@ -206,6 +206,24 @@ STORAGE_PATH = DOWNLOADS_PATH / "arxiv"
 CHART_STORAGE_PATH = DOWNLOADS_PATH / "charts"
 PLANTUML_STORAGE_PATH = DOWNLOADS_PATH / "plantuml"
 
+# Integrations that need credentials are only exposed when configured, so the tool list never
+# offers tools that can only fail. Adding credentials takes effect after a server restart.
+INTEGRATIONS_ENABLED = {
+    "Tavily": bool(os.getenv("TAVILY_API_KEY")),
+    "Exa": bool(os.getenv("EXA_API_KEY")),
+    "Email": bool(os.getenv("EMAIL_ADDRESS") and os.getenv("EMAIL_SECRET")),
+    # The OAuth client file starts authorization; an existing token can refresh on its own
+    "Google": os.path.exists(os.getenv("GOOGLE_CREDENTIALS", "credentials.json"))
+    or os.path.exists(os.getenv("GOOGLE_TOKEN", "token.json")),
+}
+
+
+def integration_tool(integration: str):
+    """Like @mcp.tool(), but skips registration when the integration is not configured."""
+    if INTEGRATIONS_ENABLED[integration]:
+        return mcp.tool()
+    return lambda fn: fn
+
 #
 # SQL Database functionality
 #
@@ -949,7 +967,7 @@ async def top_news_resource() -> str:
 # Tavily Search functionality
 #
 
-@mcp.tool()
+@integration_tool("Tavily")
 def tavily_search(
     query: str,
     search_depth: str = "advanced",
@@ -1040,7 +1058,7 @@ def search_resource(query: str) -> str:
 # Tavily Extract functionality
 #
 
-@mcp.tool()
+@integration_tool("Tavily")
 def extract_url(url: str, ctx: Context = None) -> dict:
     """
     Extract content from a URL using Tavily Extract API.
@@ -1192,7 +1210,7 @@ def format_exa_run(run) -> str:
     return json.dumps({k: v for k, v in payload.items() if v is not None}, indent=2, ensure_ascii=False)
 
 
-@mcp.tool()
+@integration_tool("Exa")
 async def exa_search(
     query: str,
     num_results: int = 10,
@@ -1251,7 +1269,7 @@ async def exa_search(
         return exa_error(f"Error occurred: {e}")
 
 
-@mcp.tool()
+@integration_tool("Exa")
 async def exa_get_contents(
     urls: list[str], highlight_query: str = None, max_characters: int = 5000
 ) -> str:
@@ -1285,7 +1303,7 @@ async def exa_get_contents(
         return exa_error(f"Error occurred: {e}")
 
 
-@mcp.tool()
+@integration_tool("Exa")
 async def exa_deep_search(
     query: str, output_schema: dict = None, type: str = "deep", num_results: int = 10
 ) -> str:
@@ -1316,7 +1334,7 @@ async def exa_deep_search(
         return exa_error(f"Error occurred: {e}")
 
 
-@mcp.tool()
+@integration_tool("Exa")
 async def exa_research_start(
     query: str, output_schema: dict = None, effort: str = "low"
 ) -> str:
@@ -1342,7 +1360,7 @@ async def exa_research_start(
         return exa_error(f"Error occurred: {e}")
 
 
-@mcp.tool()
+@integration_tool("Exa")
 async def exa_research_get(run_id: str, wait_seconds: int = 30) -> str:
     """
     Get the status and result of a research run started with exa_research_start.
@@ -5070,7 +5088,7 @@ def finish_google_oauth(code: str) -> Dict[str, Any]:
     return {"success": True, "message": "Google account connected."}
 
 
-@mcp.tool()
+@integration_tool("Google")
 def google_auth_start() -> Dict[str, Any]:
     """Begin Google (Calendar and Drive) authorization and return the URL to approve it.
 
@@ -5126,7 +5144,7 @@ def google_auth_start() -> Dict[str, Any]:
         return {"success": False, "error": str(exc)}
 
 
-@mcp.tool()
+@integration_tool("Google")
 def google_auth_complete(redirect_url: str = "", code: str = "") -> Dict[str, Any]:
     """Finish Google authorization with the URL the browser landed on, or a bare code.
 
@@ -5195,7 +5213,7 @@ def run_google_calendar(operation):
         return {"success": False, "error": google_calendar_error(exc)}
 
 
-@mcp.tool()
+@integration_tool("Google")
 def connect_calendar() -> Dict[str, Any]:
     """Authenticate with Google Calendar and cache the API client."""
     def operation():
@@ -5205,7 +5223,7 @@ def connect_calendar() -> Dict[str, Any]:
     return run_google_calendar(operation)
 
 
-@mcp.tool()
+@integration_tool("Google")
 def calendar_health() -> Dict[str, Any]:
     """Check whether Google Calendar authentication and API access work."""
     def operation():
@@ -5221,7 +5239,7 @@ def calendar_health() -> Dict[str, Any]:
     return run_google_calendar(operation)
 
 
-@mcp.tool()
+@integration_tool("Google")
 def list_calendars() -> Dict[str, Any]:
     """List calendars visible to the authenticated Google account."""
     def operation():
@@ -5241,7 +5259,7 @@ def list_calendars() -> Dict[str, Any]:
     return run_google_calendar(operation)
 
 
-@mcp.tool()
+@integration_tool("Google")
 def list_events(
     calendar_id: str = "primary",
     limit: int = 10,
@@ -5276,7 +5294,7 @@ def list_events(
     return run_google_calendar(operation)
 
 
-@mcp.tool()
+@integration_tool("Google")
 def get_event(event_id: str, calendar_id: str = "primary") -> Dict[str, Any]:
     """Get details for one Google Calendar event."""
     def operation():
@@ -5291,7 +5309,7 @@ def get_event(event_id: str, calendar_id: str = "primary") -> Dict[str, Any]:
     return run_google_calendar(operation)
 
 
-@mcp.tool()
+@integration_tool("Google")
 def create_event(
     summary: str,
     start: str,
@@ -5337,7 +5355,7 @@ def create_event(
     return run_google_calendar(operation)
 
 
-@mcp.tool()
+@integration_tool("Google")
 def update_event(
     event_id: str,
     calendar_id: str = "primary",
@@ -5377,7 +5395,7 @@ def update_event(
     return run_google_calendar(operation)
 
 
-@mcp.tool()
+@integration_tool("Google")
 def delete_event(
     event_id: str,
     calendar_id: str = "primary",
@@ -5397,7 +5415,7 @@ def delete_event(
     return run_google_calendar(operation)
 
 
-@mcp.tool()
+@integration_tool("Google")
 def list_calendar_acl(calendar_id: str = "primary") -> Dict[str, Any]:
     """List access-control rules for a Google Calendar."""
     def operation():
@@ -5411,7 +5429,7 @@ def list_calendar_acl(calendar_id: str = "primary") -> Dict[str, Any]:
     return run_google_calendar(operation)
 
 
-@mcp.tool()
+@integration_tool("Google")
 def share_calendar(
     email_address: str,
     role: str = "reader",
@@ -5430,7 +5448,7 @@ def share_calendar(
     return run_google_calendar(operation)
 
 
-@mcp.tool()
+@integration_tool("Google")
 def watch_calendar_events(
     webhook_url: str,
     calendar_id: str = "primary",
@@ -5453,7 +5471,7 @@ def watch_calendar_events(
     return run_google_calendar(operation)
 
 
-@mcp.tool()
+@integration_tool("Google")
 def list_event_changes(
     sync_token: str,
     calendar_id: str = "primary",
@@ -5535,7 +5553,7 @@ DRIVE_FILE_FIELDS = (
 )
 
 
-@mcp.tool()
+@integration_tool("Google")
 def connect_drive() -> Dict[str, Any]:
     """Authenticate with Google Drive using the shared Google OAuth token."""
     def operation():
@@ -5545,7 +5563,7 @@ def connect_drive() -> Dict[str, Any]:
     return run_google_drive(operation)
 
 
-@mcp.tool()
+@integration_tool("Google")
 def drive_health() -> Dict[str, Any]:
     """Check Google Drive authentication and API access."""
     def operation():
@@ -5560,7 +5578,7 @@ def drive_health() -> Dict[str, Any]:
     return run_google_drive(operation)
 
 
-@mcp.tool()
+@integration_tool("Google")
 def search_drive_files(
     query: str = "",
     limit: int = 20,
@@ -5592,7 +5610,7 @@ def search_drive_files(
     return run_google_drive(operation)
 
 
-@mcp.tool()
+@integration_tool("Google")
 def get_drive_file(file_id: str) -> Dict[str, Any]:
     """Get metadata for one Google Drive file."""
     def operation():
@@ -5607,7 +5625,7 @@ def get_drive_file(file_id: str) -> Dict[str, Any]:
     return run_google_drive(operation)
 
 
-@mcp.tool()
+@integration_tool("Google")
 def read_drive_file(file_id: str, max_characters: int = 100000) -> Dict[str, Any]:
     """Read a Google Doc, Sheet, or text-based Drive file as text."""
     def operation():
@@ -5643,7 +5661,7 @@ def read_drive_file(file_id: str, max_characters: int = 100000) -> Dict[str, Any
     return run_google_drive(operation)
 
 
-@mcp.tool()
+@integration_tool("Google")
 def download_drive_file(file_id: str, filename: str | None = None) -> Dict[str, Any]:
     """Download or export a Google Drive file to the configured download folder."""
     def operation():
@@ -5933,7 +5951,7 @@ def email_header_metadata(
     }
 
 
-@mcp.tool()
+@integration_tool("Email")
 def connect() -> Dict[str, Any]:
     """Establish and retain an authenticated IMAP connection."""
     try:
@@ -5948,7 +5966,7 @@ def connect() -> Dict[str, Any]:
         return {"success": False, "error": email_friendly_error(exc)}
 
 
-@mcp.tool()
+@integration_tool("Email")
 def health() -> Dict[str, Any]:
     """Check email configuration, IMAP connectivity, and authentication."""
     try:
@@ -5966,7 +5984,7 @@ def health() -> Dict[str, Any]:
         return {"healthy": False, "error": email_friendly_error(exc)}
 
 
-@mcp.tool()
+@integration_tool("Email")
 def list_folders() -> Dict[str, Any]:
     """List folders available in the configured email account."""
     try:
@@ -5984,7 +6002,7 @@ def list_folders() -> Dict[str, Any]:
         return {"success": False, "error": email_friendly_error(exc)}
 
 
-@mcp.tool()
+@integration_tool("Email")
 def latest_emails(limit: int = 5) -> Dict[str, Any]:
     """Return metadata for the latest messages in the inbox."""
     try:
@@ -6008,7 +6026,7 @@ def latest_emails(limit: int = 5) -> Dict[str, Any]:
         return {"success": False, "error": email_friendly_error(exc)}
 
 
-@mcp.tool()
+@integration_tool("Email")
 def read_email(message_id: str | int) -> Dict[str, Any]:
     """Read one email without changing its read/unread state."""
     try:
@@ -6019,7 +6037,7 @@ def read_email(message_id: str | int) -> Dict[str, Any]:
         return {"success": False, "error": email_friendly_error(exc)}
 
 
-@mcp.tool()
+@integration_tool("Email")
 def search_emails(
     unread: bool = False,
     subject: str | None = None,
@@ -6069,7 +6087,7 @@ def search_emails(
         return {"success": False, "error": email_friendly_error(exc)}
 
 
-@mcp.tool()
+@integration_tool("Email")
 def send_email(
     to: str,
     subject: str,
@@ -6119,19 +6137,19 @@ def send_email(
         return {"success": False, "error": email_friendly_error(exc)}
 
 
-@mcp.tool()
+@integration_tool("Email")
 def mark_read(message_id: str | int) -> Dict[str, Any]:
     """Mark an inbox message as read."""
     return set_email_seen_flag(message_id, True)
 
 
-@mcp.tool()
+@integration_tool("Email")
 def mark_unread(message_id: str | int) -> Dict[str, Any]:
     """Mark an inbox message as unread."""
     return set_email_seen_flag(message_id, False)
 
 
-@mcp.tool()
+@integration_tool("Email")
 def delete_email(message_id: str | int) -> Dict[str, Any]:
     """Permanently delete an inbox message using the IMAP Deleted flag."""
     try:
@@ -6152,7 +6170,7 @@ def delete_email(message_id: str | int) -> Dict[str, Any]:
         return {"success": False, "error": email_friendly_error(exc)}
 
 
-@mcp.tool()
+@integration_tool("Email")
 def list_attachments(message_id: str | int) -> Dict[str, Any]:
     """List attachment filenames for an email without downloading them."""
     try:
@@ -6169,7 +6187,7 @@ def list_attachments(message_id: str | int) -> Dict[str, Any]:
         return {"success": False, "error": email_friendly_error(exc)}
 
 
-@mcp.tool()
+@integration_tool("Email")
 def summarize_email(message_id: str | int) -> Dict[str, Any]:
     """Return the cleaned body of an email without using an LLM."""
     try:
@@ -6193,6 +6211,13 @@ def main() -> None:
 
     signal.signal(signal.SIGINT, stop_server)
     try:
+        disabled = [name for name, enabled in INTEGRATIONS_ENABLED.items() if not enabled]
+        if disabled:
+            print(
+                f"Not configured, tools hidden: {', '.join(disabled)} (see .env.example)",
+                file=sys.stderr,
+                flush=True,
+            )
         print("MCP server running. Press Ctrl+C to stop.", file=sys.stderr, flush=True)
         mcp.run()
     except KeyboardInterrupt:

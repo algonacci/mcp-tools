@@ -15,8 +15,18 @@ typing. Run it again whenever you want to add or update an integration.
 
 You do not need to configure every integration. The MCP server still starts
 with a partial or missing `.env`; tools such as GARUDA, Wikipedia, Google News,
-Open-Meteo weather, PDF, and local file readers remain available. A tool that
-needs missing credentials returns a setup error only when that tool is called.
+Open-Meteo weather, PDF, and local file readers remain available. Integrations
+that need credentials are left out of the tool list until they are configured,
+and the server names them on stderr at startup:
+
+| Integration | Exposed when |
+|---|---|
+| Tavily (`tavily_search`, `extract_url`) | `TAVILY_API_KEY` is set |
+| Exa (`exa_*`) | `EXA_API_KEY` is set |
+| Email | `EMAIL_ADDRESS` and `EMAIL_SECRET` are set |
+| Google Calendar and Drive | `credentials.json` or `token.json` exists |
+
+Restart the server after adding credentials so the new tools are registered.
 
 ## Weather
 
