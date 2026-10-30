@@ -23,10 +23,27 @@ and the server names them on stderr at startup:
 |---|---|
 | Tavily (`tavily_search`, `extract_url`) | `TAVILY_API_KEY` is set |
 | Exa (`exa_*`) | `EXA_API_KEY` is set |
+| TinyFish (`tinyfish_search`, `tinyfish_fetch`) | `TINYFISH_API_KEY` is set |
+| Firecrawl (`firecrawl_crawl`, `firecrawl_get_crawl`) | `FIRECRAWL_API_KEY` is set |
 | Email | `EMAIL_ADDRESS` and `EMAIL_SECRET` are set |
 | Google Calendar and Drive | `credentials.json` or `token.json` exists |
 
 Restart the server after adding credentials so the new tools are registered.
+
+## TinyFish and Firecrawl
+
+- `tinyfish_search` searches the web with domain, language, and location
+  filters. Results are capped at 20 per call.
+- `tinyfish_fetch` extracts up to 10 public HTTP(S) URLs as Markdown, text, or
+  HTML. The default provider-cache TTL is one hour.
+- `firecrawl_crawl` starts an asynchronous crawl capped at 20 pages. It skips
+  sitemaps and does not follow external links or subdomains to protect credits.
+- `firecrawl_get_crawl` retrieves job status and available page results using
+  the ID returned by `firecrawl_crawl`.
+
+TinyFish currently documents 12,000 free searches per day for personal
+accounts. Firecrawl's free plan currently includes 1,000 monthly credits; one
+crawl can consume multiple credits depending on the pages processed.
 
 ## Weather
 

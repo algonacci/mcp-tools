@@ -211,6 +211,8 @@ PLANTUML_STORAGE_PATH = DOWNLOADS_PATH / "plantuml"
 INTEGRATIONS_ENABLED = {
     "Tavily": bool(os.getenv("TAVILY_API_KEY")),
     "Exa": bool(os.getenv("EXA_API_KEY")),
+    "TinyFish": bool(os.getenv("TINYFISH_API_KEY")),
+    "Firecrawl": bool(os.getenv("FIRECRAWL_API_KEY")),
     "Email": bool(os.getenv("EMAIL_ADDRESS") and os.getenv("EMAIL_SECRET")),
     # The OAuth client file starts authorization; an existing token can refresh on its own
     "Google": os.path.exists(os.getenv("GOOGLE_CREDENTIALS", "credentials.json"))
@@ -1114,6 +1116,193 @@ def extract_resource(url: str) -> str:
         return result
     except Exception as e:
         return f"# Error Extracting URL Content\n\nThere was a problem extracting content from '{url}': {str(e)}"
+
+#
+# TinyFish Search and Fetch functionality
+#
+
+TINYFISH_SEARCH_URL = "https://api.search.tinyfish.ai"
+TINYFISH_FETCH_URL = "https://api.fetch.tinyfish.ai"
+TINYFISH_MAX_RESULTS = 20
+TINYFISH_MAX_URLS = 10
+
+
+def _configured_key(name: str) -> str:
+    key = os.getenv(name)
+    if not key:
+        raise ValueError(f"{name} environment variable not set")
+    return key
+
+
+def _http_error(provider: str, exc: Exception) -> dict:
+    if isinstance(exc, httpx.HTTPStatusError):
+        return {
+            "success": False,
+            "provider": provider,
+            "status_code": exc.response.status_code,
+            "error": f"{provider} returned HTTP {exc.response.status_code}",
+        }
+    return {"success": False, "provider": provider, "error": str(exc)}
+
+
+@integration_tool("TinyFish")
+async def tinyfish_search(
+    query: str,
+    max_results: int = 10,
+    include_domains: Optional[List[str]] = None,
+    exclude_domains: Optional[List[str]] = None,
+    location: str = "US",
+    language: str = "en",
+    ctx: Context = None,
+) -> dict:
+    """Search the web with TinyFish and return ranked links and snippets.
+
+    max_results is capped at 20 locally. Domain filters accept up to 20 domains.
+    TinyFish currently documents a free daily search allowance, but callers
+    should still avoid unnecessary repeated searches.
+    """
+    query = query.strip()
+    if not query:
+        return {"success": False, "error": "query must not be empty"}
+    limit = max(1, min(max_results, TINYFISH_MAX_RESULTS))
+    params = {"query": query, "location": location, "language": language}
+    if include_domains:
+        params["include_domains"] = ",".join(include_domains[:20])
+    if exclude_domains:
+        params["exclude_domains"] = ",".join(exclude_domains[:20])
+    if ctx:
+        ctx.info(f"Searching TinyFish for: {query}")
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(
+                TINYFISH_SEARCH_URL,
+                params=params,
+                headers={"X-API-Key": _configured_key("TINYFISH_API_KEY")},
+            )
+            response.raise_for_status()
+            payload = response.json()
+            payload["results"] = payload.get("results", [])[:limit]
+            return payload
+    except (httpx.HTTPError, ValueError) as exc:
+        return _http_error("TinyFish", exc)
+
+
+@integration_tool("TinyFish")
+async def tinyfish_fetch(
+    urls: List[str],
+    format: str = "markdown",
+    cache_ttl_seconds: int = 3600,
+    ctx: Context = None,
+) -> dict:
+    """Fetch and extract up to 10 public HTTP(S) URLs with TinyFish.
+
+    format may be markdown, text, or html. TinyFish rejects localhost, private
+    IP addresses, and cloud metadata endpoints upstream.
+    """
+    valid_urls = []
+    for value in urls[:TINYFISH_MAX_URLS]:
+        parsed = urlparse(value)
+        if parsed.scheme in {"http", "https"} and parsed.netloc:
+            valid_urls.append(value)
+    if not valid_urls:
+        return {"success": False, "error": "at least one public HTTP(S) URL is required"}
+    if format not in {"markdown", "text", "html"}:
+        return {"success": False, "error": "format must be markdown, text, or html"}
+    if ctx:
+        ctx.info(f"Fetching {len(valid_urls)} URL(s) with TinyFish")
+    try:
+        async with httpx.AsyncClient(timeout=45.0) as client:
+            response = await client.post(
+                TINYFISH_FETCH_URL,
+                headers={"X-API-Key": _configured_key("TINYFISH_API_KEY")},
+                json={
+                    "urls": valid_urls,
+                    "format": format,
+                    "links": False,
+                    "image_links": False,
+                    "ttl": max(0, min(cache_ttl_seconds, 86400)),
+                    "per_url_timeout_ms": 30000,
+                },
+            )
+            response.raise_for_status()
+            return response.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        return _http_error("TinyFish", exc)
+
+
+#
+# Firecrawl functionality
+#
+
+FIRECRAWL_BASE_URL = "https://api.firecrawl.dev/v2"
+FIRECRAWL_MAX_PAGES = 20
+
+
+@integration_tool("Firecrawl")
+async def firecrawl_crawl(
+    url: str,
+    prompt: Optional[str] = None,
+    max_pages: int = 10,
+    max_depth: int = 2,
+    ctx: Context = None,
+) -> dict:
+    """Start an asynchronous Firecrawl crawl and return its job ID.
+
+    Jobs are capped at 20 pages, skip sitemaps, and cannot follow external
+    links or subdomains. Use firecrawl_get_crawl with the returned ID.
+    """
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return {"success": False, "error": "a valid HTTP(S) URL is required"}
+    limit = max(1, min(max_pages, FIRECRAWL_MAX_PAGES))
+    depth = max(0, min(max_depth, 5))
+    body = {
+        "url": url,
+        "maxDiscoveryDepth": depth,
+        "limit": limit,
+        "sitemap": "skip",
+        "allowExternalLinks": False,
+        "allowSubdomains": False,
+        "scrapeOptions": {
+            "formats": ["markdown"],
+            "onlyMainContent": True,
+            "storeInCache": True,
+        },
+    }
+    if prompt:
+        body["prompt"] = prompt[:2000]
+    if ctx:
+        ctx.info(f"Starting Firecrawl job for {url} (up to {limit} pages)")
+    try:
+        async with httpx.AsyncClient(timeout=45.0) as client:
+            response = await client.post(
+                f"{FIRECRAWL_BASE_URL}/crawl",
+                headers={"Authorization": f"Bearer {_configured_key('FIRECRAWL_API_KEY')}"},
+                json=body,
+            )
+            response.raise_for_status()
+            return response.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        return _http_error("Firecrawl", exc)
+
+
+@integration_tool("Firecrawl")
+async def firecrawl_get_crawl(crawl_id: str, ctx: Context = None) -> dict:
+    """Get status and available page results for a Firecrawl crawl job."""
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,200}", crawl_id):
+        return {"success": False, "error": "invalid crawl_id"}
+    if ctx:
+        ctx.info(f"Checking Firecrawl job: {crawl_id}")
+    try:
+        async with httpx.AsyncClient(timeout=45.0) as client:
+            response = await client.get(
+                f"{FIRECRAWL_BASE_URL}/crawl/{crawl_id}",
+                headers={"Authorization": f"Bearer {_configured_key('FIRECRAWL_API_KEY')}"},
+            )
+            response.raise_for_status()
+            return response.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        return _http_error("Firecrawl", exc)
 
 #
 # Exa web search functionality
